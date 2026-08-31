@@ -1588,6 +1588,7 @@ dependencies = [
  "glutin",
  "glutin-winit",
  "hmac",
+ "http",
  "image",
  "jiff",
  "ksni",
