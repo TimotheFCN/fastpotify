@@ -33,8 +33,9 @@ song to play from there, Ctrl-click to select several, drag the corner to
 make it taller, and its X or PL again closes it. Its buttons do what
 Spotify allows of what Winamp's did: ADD finds music, SEL picks rows,
 MISC opens the song's pages, LIST OPTS plays one of your playlists or
-saves the queue as a new one, and REM only explains that no app can take
-from Spotify's queue. Notices that the big window shows as toasts scroll
+saves the queue as a new one, and REM's Remove all clears what you
+queued when this computer is the player (no app can take single songs
+from Spotify's queue). Notices that the big window shows as toasts scroll
 through the marquee here. **EQ** opens the equalizer between the player and the playlist: Winamp's
 ten bands and its presets, shaping the music played on this computer (a
 speaker across the room plays what Spotify sends it). The preamp goes
@@ -69,7 +70,8 @@ press **F** to fill the screen, **Esc** to come back or close it, and drag
 the bottom-right corner to resize. Presets fade into one another every
 thirty seconds (Settings sets the time); the right arrow, **N**, or space
 moves on at once, the left arrow or **P** goes back, and **L** keeps the one
-playing. Presets live in the `milkdrop` folder of the config directory;
+playing. Press **?** for the keys, over the picture; when the song changes,
+its name shows there for a moment too, then fades. Presets live in the `milkdrop` folder of the config directory;
 nothing ships inside the app, and Settings fetches the two packs projectM
 curates into it: the 550 that came with MilkDrop 2, and Cream of the Crop,
 9,800 of the community's best. Until there are any, projectM shows its own

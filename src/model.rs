@@ -442,6 +442,10 @@ pub enum RowContext {
     },
     /// A loose list of tracks, played as a queue of URIs.
     Uris(Vec<String>),
+    /// A row of Next up. Playing one consumes the queue down to it, the
+    /// way pressing Next that many times would, so the playing context
+    /// and the rows after it stay intact.
+    Queue,
     /// A sorted or filtered view of a context: plays exactly the list on
     /// screen, while the context stays what the interface calls playing.
     View {
@@ -584,6 +588,11 @@ pub enum Action {
     /// Hand the account to a receiver found on the local network.
     ActivateReceiver(Box<crate::zeroconf::Receiver>),
     RefreshDevices,
+    /// Empty Next up of its queued songs, keeping the context's own.
+    ClearQueue,
+    /// The queue, made permanent: a new playlist of the playing song and
+    /// every row after it.
+    SaveQueueAsPlaylist,
     RefreshQueue,
     CopyLink(String),
     /// A web page, in the browser.

@@ -79,7 +79,7 @@ pub(super) fn show(app: &mut App, view: &mut View, now: Option<&NowPlaying>, foc
     }
 
     let (rows, queue_uris) = rows(app, now);
-    list(app, view, &rows, &queue_uris, height);
+    list(app, view, &rows, height);
     scrollbar(app, view, rows.len(), height);
     grip(app, view, height);
     times(app, view, now, &rows, height);
@@ -345,7 +345,7 @@ fn label(number: usize, subtitle: &str, title: &str) -> String {
 }
 
 /// The rows, in the skin's colours and a font the size Winamp's was.
-fn list(app: &mut App, view: &mut View, rows: &[Row], queue_uris: &[String], height: u32) {
+fn list(app: &mut App, view: &mut View, rows: &[Row], height: u32) {
     let style = view.skin.playlist.clone();
     let rgb = |color: [u8; 3]| Color32::from_rgb(color[0], color[1], color[2]);
     let area = list_area(height);
@@ -437,7 +437,7 @@ fn list(app: &mut App, view: &mut View, rows: &[Row], queue_uris: &[String], hei
             && let Some(index) = row.queued
         {
             app.actions.push(Action::PlayFromRow {
-                context: RowContext::Uris(queue_uris.to_vec()),
+                context: RowContext::Queue,
                 uri: row.uri.clone(),
                 index: index as u32,
             });
@@ -631,7 +631,7 @@ fn menus(app: &mut App, view: &mut View, rows: &[Row], queue_uris: &[String], he
             unit,
             |ui| match name {
                 "add" => add_menu(app, ui),
-                "rem" => rem_menu(ui),
+                "rem" => rem_menu(app, ui),
                 "sel" => sel_menu(app, ui, rows),
                 "misc" => misc_menu(app, ui, rows),
                 _ => list_menu(app, ui, rows, queue_uris),
@@ -652,11 +652,15 @@ fn add_menu(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
-fn rem_menu(ui: &mut egui::Ui) {
-    let why = "Spotify keeps its queue; no app can take from it.";
-    for label in ["Remove selected", "Remove all"] {
-        ui.add_enabled(false, egui::Button::new(label))
-            .on_disabled_hover_text(why);
+fn rem_menu(app: &mut App, ui: &mut egui::Ui) {
+    ui.add_enabled(false, egui::Button::new("Remove selected"))
+        .on_disabled_hover_text("Spotify has no way to take one song from the queue.");
+    if ui
+        .add_enabled(app.can_clear_queue(), egui::Button::new("Remove all"))
+        .on_disabled_hover_text("Only this computer's own queue can be cleared.")
+        .clicked()
+    {
+        app.actions.push(Action::ClearQueue);
     }
 }
 
@@ -747,9 +751,8 @@ fn list_menu(app: &mut App, ui: &mut egui::Ui, rows: &[Row], queue_uris: &[Strin
             .map(|row| row.uri.clone())
             .collect();
         uris.extend(queue_uris.iter().cloned());
-        let today = jiff::Zoned::now().strftime("%Y-%m-%d").to_string();
         app.actions.push(Action::CreatePlaylist {
-            name: format!("Queue {today}"),
+            name: app.queue_playlist_name(),
             public: false,
             add_uris: uris,
         });

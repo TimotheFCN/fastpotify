@@ -29,8 +29,18 @@ These instructions add implementation constraints for coding agents.
   the dependency when the reason is not obvious.
 
 Read `docs/_reference/how-it-connects.md` before changing authentication,
-Spotify requests, Connect, credential storage, or network behaviour. Read the
+Spotify requests, Connect, credential storage, or network behaviour. Read
+`docs/_reference/queue.md` before touching the queue: its rules are the
+contract, and the queue tests in `src/app.rs` enforce them. Read the
 nearby module tests before changing a state machine or API fallback.
+
+The interface is optimistic, always. A control shows its result the
+moment it is used: a double-clicked song is the playing song, Next pops
+the queue's head, an added song has its row. The backend then makes it
+true and Spotify's state catches up behind; an answer that still tells
+the story from before the user's action is stale, so hold the shown
+state and ask again rather than let the lagging answer undo what the
+user just did. Nothing the user did may ever flicker away and come back.
 
 Every visualiser, the spectrum analyser, the oscilloscope, and MilkDrop,
 shows the signal post-equalizer and pre-volume: the EQ shapes what is
