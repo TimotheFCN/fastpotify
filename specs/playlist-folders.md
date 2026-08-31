@@ -1,7 +1,7 @@
 # Playlist folders
 
-Status: ready for implementation on main's read-only folder support. Every protocol claim below
-was verified against a real account on 2026-08-31 by `examples/rootlist_probe.rs`.
+Status: ready for implementation against main at `ebdc625`. Every protocol claim below was
+verified against a real account on 2026-08-31 by `examples/rootlist_probe.rs`.
 
 ## Goal
 
@@ -25,6 +25,11 @@ Commit `031ef3e` added best-effort, read-only folders: `Engine::rootlist`, `pars
 visuals, indentation, recursive counts, collapse behavior and the pinned block. Replace the
 protocol model and lifecycle in place, without a second rootlist representation or a second request
 path beside the existing command and event.
+
+The commits through `ebdc625` leave that rootlist path unchanged. They do add two conventions this
+work must follow. The interface now shows an action before Spotify confirms it and refuses to let a
+stale answer undo it. Saving the queue also creates a playlist through the shared `CreatePlaylist`
+and `PlaylistCreated` path, so rootlist reconciliation must cover that entry point.
 
 Two of main's choices cannot support writes and go first. The parser is deliberately forgiving: it
 repairs unclosed folders, ignores unmatched end markers, accepts malformed ids and names, and drops
@@ -153,31 +158,69 @@ makes the snapshot unsafe and fails the folder read: collapse state, row identit
 are all keyed by folder id long before the planner sees an intent, so an ambiguous id cannot be
 carried any further. An unknown URI becomes an unknown item and stays in place.
 
-Store a confirmed snapshot with the Web API account id that owns it, in one state value rather than
-a set of booleans, so the UI cannot ask a question the model cannot answer. Something like:
+Keep folder state together, following the repository's `Loadable<T>` plus adjacent work-state
+pattern. Store the Web API account id with the confirmed snapshot. Something like:
 
 ```rust
-enum Folders {
-    Unavailable { error: Option<String> },
-    Loading,
-    Ready { snapshot: Snapshot, activity: Activity, last_error: Option<String> },
+struct FolderState {
+    confirmed: Loadable<OwnedSnapshot>,
+    work: FolderWork,
+    last_error: Option<String>,
 }
 
-enum Activity { Idle, Refreshing, Mutating }
+struct OwnedSnapshot {
+    account_id: String,
+    snapshot: Snapshot,
+}
+
+enum FolderWork {
+    Idle,
+    Refreshing,
+    Mutating(PendingChange),
+    Unknown(PendingChange),
+}
+
+struct PendingChange {
+    projected: Snapshot,
+    postcondition: Postcondition,
+}
 ```
 
-A snapshot whose background refresh failed stays on screen with its error. Writability is derived
-from a ready snapshot, a matching account, a live engine and `Activity::Idle`, not stored.
+Keep these fields private and change them through `FolderState` methods. `FolderWork` may differ
+from `Idle` only while `confirmed` is loaded. A first-load failure belongs in `Loadable::Failed`; a
+background failure leaves the loaded snapshot in place and sets `last_error`. `shown_snapshot()`
+returns a pending projection when one exists and the confirmed snapshot otherwise. Planning always
+uses `confirmed_snapshot()`.
+
+Writability is derived from a loaded snapshot, a matching account, a live engine and
+`FolderWork::Idle`. Do not store another writable or available boolean. A disconnected engine
+leaves a loaded snapshot visible but read-only. An account change resets the whole state before the
+new account's metadata can render.
+
+A normal successful load or refresh replaces `confirmed`, returns `work` to `Idle` and clears
+`last_error`. A failed first load sets `confirmed` to `Loadable::Failed`. A failed background
+refresh keeps `confirmed`, returns `work` to `Idle` and records `last_error`. An account reset sets
+`confirmed` to `Loadable::NotLoaded`, sets `work` to `Idle` and clears the error.
 
 UI intents refer to folder ids and playlist URIs, never indexes. The required intents are: create a
 folder under a folder or at the root, rename a folder, move a playlist or whole folder under a
 parent and optionally before one of that parent's direct children, and delete a folder while either
-keeping or removing its contents.
+keeping or removing its contents. A separate `PlaceCreatedPlaylist` intent carries the URI returned
+by a successful `PlaylistCreated` response and its destination folder.
 
-Planning resolves each reference against the snapshot and produces the operations and the intent's
-postcondition together. A reference that does not resolve to exactly one item is refused, as is an
-invalid parent, a `before` node that is not a direct child of the destination, and a folder moved
-into itself or a descendant. An intent the snapshot already satisfies produces no mutation.
+Planning resolves each reference against the confirmed snapshot and produces the operations, a
+projected snapshot and the intent's postcondition together. The projection comes from the same
+plan as the wire operations, so display and transport cannot interpret an intent differently. A
+reference that does not resolve to exactly one item is refused, as is an invalid parent, a `before`
+node that is not a direct child of the destination, and a folder moved into itself or a descendant.
+An intent the confirmed snapshot already satisfies produces no mutation.
+
+`PlaceCreatedPlaylist` is the only source-resolution exception. Its URI comes from the successful
+Web API response for the same account, and Spotify has already added that playlist at the root. If
+the confirmed snapshot does not contain it yet, plan a `MOV` naming that URI and project it directly
+under the destination. If the snapshot contains it once, plan an ordinary move. Refuse a duplicate
+or malformed occurrence. The destination must still resolve against the confirmed snapshot, and
+the postcondition requires exactly one occurrence under that destination.
 
 Do not offer "delete folder and contents" when the span holds an unknown item or a playlist the
 user cannot see, because that operation removes playlists from the library and Fastpotify would be
@@ -204,27 +247,45 @@ the current operation finishes. Because operations are addressed by item, a muta
 slightly stale snapshot fails loudly or does nothing rather than hitting the wrong folder, so this
 serialization is for a calm UI, not for safety.
 
-A change is: plan it from the confirmed snapshot, send one POST, read one complete rootlist back,
-publish it, and check it against the postcondition. There is no GET before the POST.
+Keep the backend lane separate from `FolderState`. The lane is authoritative for network
+scheduling and coalescing. `FolderState.work` records what the interface should show after it emits
+a command and while it handles the resulting events; it never decides whether the backend may
+start another request.
+
+For each change, plan it from the confirmed snapshot and install the projected snapshot in
+`FolderWork::Mutating`. Send one POST, then read complete rootlists until the postcondition appears
+or a fixed stale-read budget expires. There is no GET before the POST. Never plan another mutation
+from the projected snapshot, and keep write controls disabled until the work returns to `Idle`.
 
 Classify the send by what actually happened rather than by status family, because HTTP 408 and 5xx
 are as uncertain as a dropped connection while a token or request-building failure means nothing
 was sent at all:
 
-- nothing sent: report the failure and leave the snapshot alone.
+- nothing sent: clear the projection, return to `Idle`, show the confirmed snapshot, record the
+  error and report the failure.
 - rejected: 400 for a change Spotify will not apply, such as an anchor item that is no longer
   there, and 509 for a revision it never issued. A 429 is also a refusal, applied to nothing.
-  Report it and leave the snapshot alone.
+  Clear the projection, return to `Idle`, show the confirmed snapshot, record the error and report
+  the failure.
 - accepted, or uncertain: read back, then let the postcondition decide.
 
-Always read back after a POST that may have reached Spotify, including after a timeout. If the tree
-satisfies the postcondition, report success. If it does not, publish the tree and report the write
-error. If the readback also fails, keep the last confirmed tree and say the outcome is unknown.
-Never retry a mutation automatically. Put a finite timeout around the whole operation, covering
-token acquisition, the request and the response, so the lane always clears.
+Always read back after a POST that may have reached Spotify, including after a timeout. If a tree
+satisfies the postcondition, publish it as confirmed, clear the projection, return to `Idle`, clear
+the error and report success. If a tree does not satisfy it, treat that answer as stale at first:
+keep the projection on screen and ask again after a short delay. Use a fixed retry count within the
+operation timeout, following the queue's existing stale-answer rule rather than introducing a
+shared synchronization abstraction.
 
-Do not update the rootlist optimistically. The drag preview may animate, but the confirmed tree
-stays until Spotify answers.
+If Spotify keeps returning a tree that contradicts the postcondition, publish the last tree, clear
+the projection, return to `Idle` and record the failed change. If no readback succeeds before the
+timeout, keep the projection visible in `FolderWork::Unknown`, make it read-only and record that the
+outcome is unknown. A later successful refresh continues the same bounded postcondition check. It
+either confirms the change or lets Spotify's tree win with an error. Never retry a mutation
+automatically.
+
+Put a finite timeout around token acquisition, the POST and its immediate readbacks so the backend
+lane always clears. An unknown projection may remain visible after the lane clears, but it does not
+make the UI writable and it does not block a later reconciliation read.
 
 Load or refresh the rootlist when a matching engine becomes ready, when the user retries, once when
 the window regains focus, and after a Web API action changes playlist membership. The readback is
@@ -235,22 +296,24 @@ Remove the current request from the end of generic `MyPlaylists` pagination. Pla
 reloads after a rename or item edit do not change rootlist membership. Rootlist loading and
 metadata pagination then run independently.
 
-When the engine disconnects, keep a previously confirmed tree on screen but make it read-only. If
-no confirmed tree exists, or the first read fails, show the existing flat playlist shelf with a
-clear "Folders unavailable" error and Retry, leaving `Settings.sidebar_order` intact for that
-fallback.
+When the engine disconnects, keep the shown tree on screen but make it read-only. This may be the
+confirmed tree or an unknown projection. If no confirmed tree exists, or the first read fails, show
+the existing flat playlist shelf with a clear "Folders unavailable" error and Retry, leaving
+`Settings.sidebar_order` intact for that fallback.
 
 An engine disconnect is different from an account change. When the Web API account changes or signs
-out, clear the snapshot and the in-memory collapse set before new metadata can render against
-them; `reset_data` is the place. The persisted collapse list needs no account tag, because folder
-ids are random 64-bit values and an id from another account simply matches nothing.
+out, clear the confirmed snapshot, any pending projection and the in-memory collapse set before new
+metadata can render against them; `reset_data` is the place. The persisted collapse list needs no
+account tag, because folder ids are random 64-bit values and an id from another account simply
+matches nothing.
 
 ## Playlist metadata and cross-API flows
 
 The rootlist owns membership, hierarchy and order in folder mode. `Library.playlists` remains the
 metadata source; index it by URI while building rows. Because the two now load independently, enter
 folder mode only once both a confirmed snapshot and usable playlist metadata are present, or the
-sidebar briefly shows folders full of nameless rows.
+sidebar briefly shows folders full of nameless rows. Once folder mode is active, render
+`shown_snapshot()` so a pending change appears immediately.
 
 Where the two disagree:
 
@@ -264,29 +327,45 @@ Spotify was prompt about this in testing: a Web API create put the new playlist 
 and a Web API unfollow removed its rootlist entry, both visible on the very next read. So these
 rules are a safety net, not the normal path.
 
-Do not blank the metadata list during a background refresh. Keep the playlist returned by the
-create endpoint in the local metadata list while the full list reloads. Pure folder moves and
-renames need no Web API refresh.
+Do not blank the metadata list during a background refresh. Keep the current `PlaylistCreated`
+behavior that inserts the returned playlist into the local metadata list immediately. Pure folder
+moves and renames need no Web API refresh.
 
 Creating a playlist in a destination folder crosses two APIs: create it through the Web API, then
 move it with one POST that names the new URI and the destination's end marker, then read back. No
-GET is needed in between, because the move names the playlist rather than an index. If placement
-fails, keep the playlist and say Spotify created it at the root. Never create it again.
+GET is needed in between, because `PlaceCreatedPlaylist` names the URI returned by the create call
+rather than an index. If placement fails, keep the playlist and say Spotify created it at the root.
+Never create it again.
 
-Create-at-root, follow and unfollow each need one rootlist refresh after the Web API call succeeds.
-Reconcile saved and metadata state from confirmed results without replacing a loaded shelf with a
-spinner.
+Extend the shared playlist-creation context with an optional destination `FolderId`, separate from
+the existing `add_uris`. Every successful `PlaylistCreated` response must lead to exactly one
+rootlist reconciliation:
+
+- a root destination requests one ordinary rootlist refresh when a matching engine is live;
+- without a matching engine, the next engine-ready load performs that reconciliation;
+- a folder destination starts the placement mutation, whose readback is the reconciliation;
+- Save Queue as a playlist and New playlist from a track use the root destination and preserve
+  their existing `add_uris` behavior.
+
+Do not make each creation entry point manage this separately. The shared `PlaylistCreated` handler
+has the returned playlist URI and the creation context, so it owns the choice. Preserve Save Queue's
+track insertion and page-opening behavior while adding the refresh.
+
+After a successful follow or unfollow, refresh at once when a matching engine is live. Otherwise,
+reconcile on the next engine-ready load. Reconcile saved and metadata state from confirmed results
+without replacing a loaded shelf with a spinner.
 
 ## Sidebar behavior
 
 Folders affect only the Playlists shelf. Albums, Artists and Podcasts stay flat. Liked Songs is the
 first row and cannot move.
 
-When a confirmed rootlist is available, Spotify's order replaces `sidebar_order` and recent-play
-sorting without erasing either setting, including for a valid rootlist with no folders. This
-deliberately replaces main's behavior, where a non-empty `sidebar_order` hides every folder. The
-saved order returns only in the flat fallback. Say so in the user guide, because dragging a
-playlist changes meaning for anyone who has reordered their sidebar before.
+When a confirmed rootlist is available, its confirmed or pending projected order replaces
+`sidebar_order` and recent-play sorting without erasing either setting, including for a valid
+rootlist with no folders. This deliberately replaces main's behavior, where a non-empty
+`sidebar_order` hides every folder. The saved order returns only in the flat fallback. Say so in the
+user guide, because dragging a playlist changes meaning for anyone who has reordered their sidebar
+before.
 
 Pinned playlists stay in Fastpotify's pinned block and appear once. Project a pinned shortcut at
 depth zero without changing the playlist's rootlist parent or its folder's recursive count.
@@ -309,8 +388,9 @@ Reuse the existing drag visuals and fixed-row arithmetic. In confirmed folder mo
 playlist drag emits a rootlist move instead of writing `Settings.sidebar_order`, and a folder may
 be dragged by its id. A drop on a folder appends to it, a drop in an unfiltered gap goes before the
 following visible sibling, and a root-edge drop moves to the root. Each of those maps to one
-anchored `MOV`. In flat fallback mode the existing local ordering is unchanged. Reject self and
-descendant drops before emitting an action.
+anchored `MOV`. Install the plan's projection as soon as the action is applied, after drawing. In
+flat fallback mode the existing local ordering is unchanged. Reject self and descendant drops
+before emitting an action.
 
 Use the existing action, dialog, menu and toast patterns:
 
@@ -332,13 +412,21 @@ Keep tests focused on invariants rather than mirroring every implementation deta
   items, numeric id identity across padding and case, and the 15-digit id this account already has.
   Include what the old parser repaired or dropped, and prove it now fails;
 - planning: every row of the operation table, unresolvable and ambiguous references, invalid
-  destinations, no-op intents, and that no operation carries an index or a revision;
-- the coordinator: single-send behavior, the send classification, account isolation, serialization,
-  coalesced refreshes, account changes, and both outcomes of an uncertain POST;
+  destinations, no-op intents, that projection and wire operations describe the same result, and
+  that no operation carries an index or a revision. Cover `PlaceCreatedPlaylist` when its URI is
+  absent, already present once and duplicated;
+- folder state: first load, retained data after a background failure, derived writability, immediate
+  pending projection, confirmed-only planning, account reset and the read-only unknown state;
+- the coordinator: single-send behavior, send classification, account isolation, serialization,
+  coalesced refreshes, a stale readback that does not undo the projection, eventual confirmation,
+  the bounded case where Spotify's tree wins, and an uncertain POST whose readbacks all fail;
 - projection: Spotify's order, an empty rootlist, pinned shortcuts at depth zero, hidden
-  metadata-less rows, the metadata gate, and the local-order fallback;
+  metadata-less rows, the metadata gate, pending order and the local-order fallback;
+- playlist creation: root creation requests one refresh, folder creation uses its placement
+  readback instead, and Save Queue keeps its tracks and opens the new playlist while requesting no
+  duplicate refresh;
 - the `folders` demo fixture: a small nested rootlist, the fallback and read-only states, flat
-  filtering, collapse, representative drag targets and both row modes.
+  filtering, collapse, representative drag targets, a pending mutation and both row modes.
 
 `cargo run --example rootlist_probe` re-reads the live hierarchy; `--write` reruns the protocol
 experiments and `--only <section>` reruns one. Both write modes need the Fastpotify app open, so
@@ -352,5 +440,6 @@ Run the full checks in `CONTRIBUTING.md` before committing. Update the connectio
 private rootlist GET and POST. Update the user guide and README where they describe playlist
 dragging as local sidebar order, and document the flat fallback and read-only states.
 
-Out of scope: local-only folders, folder playback, bulk moves, offline queues, optimistic writes,
-push subscriptions and alternate Spotify data sources.
+Out of scope: local-only folders, folder playback, bulk moves, offline queues, using a projected
+snapshot as the base for another write, automatic mutation retries, push subscriptions and
+alternate Spotify data sources.
