@@ -9,14 +9,31 @@
 //! private `playlist/v2/user/{user}/rootlist` endpoint actually accepts, using
 //! the librespot credentials Fastpotify already cached for local playback.
 //!
-//! Safety: every write appends two empty folders of its own at the end of the
-//! root list and only ever names indexes that hold one of their four marker
-//! items. Nothing in the real library is read-modified, and `--write` ends by
-//! comparing the whole list against the one it started from.
+//! # Safety
+//!
+//! Most experiments ask whether Spotify locates an operation by the items it
+//! carries or by an index. An experiment that omits the index cannot be made
+//! safe by checking that the items it names are disposable, because the whole
+//! question is whether the server reads those names at all. An ignored `items`
+//! field leaves `from_index` absent, and an absent proto2 field may read as
+//! zero, so the operation would land on whatever sits at the top of the real
+//! library.
+//!
+//! Every experiment therefore arranges the head of the rootlist to hold only
+//! items the probe owns, sacrificial ones first, as a balanced span at least as
+//! long as anything the experiment names. `assert_head_is_disposable` proves
+//! that immediately before each mutation. An operation that falls back to index
+//! zero then destroys probe data, which is exactly the observation wanted,
+//! instead of a playlist.
+//!
+//! The two playlists the probe needs are created through the Web API with the
+//! token Fastpotify already cached, and unfollowed again at the end. The run
+//! finishes by comparing the whole URI vector against the one it started from.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use librespot_core::{Session, SessionConfig, cache::Cache};
 use librespot_protocol::playlist4_external::{
     Add, Delta, Item, ListChanges, Mov, Op, Rem, SelectedListContent, UpdateItemUris,
@@ -24,12 +41,18 @@ use librespot_protocol::playlist4_external::{
 };
 use protobuf::Message;
 
-/// Both probe folder ids share this prefix, so cleanup can find them and the
-/// guards can tell probe items from real ones. Spotify parses a group id as a
+/// Every probe folder id contains this, so cleanup can find them and the
+/// guards can tell probe markers from real ones. Spotify parses a group id as a
 /// hexadecimal u64, so every character has to be a hex digit.
 const PREFIX: &str = "fa57007ffee1d0";
-const P: &str = "fa57007ffee1d00a";
-const Q: &str = "fa57007ffee1d00b";
+/// Sacrificial folders: whatever a fallback coordinate hits.
+const S1: &str = "fa57007ffee1d051";
+const S2: &str = "fa57007ffee1d052";
+/// Targets: what an identity-addressed operation should hit instead.
+const P: &str = "fa57007ffee1d0aa";
+const Q: &str = "fa57007ffee1d0bb";
+/// A 16-digit id whose first digit is zero, to see what comes back.
+const Z: &str = "0fa57007ffee1d0e";
 
 fn start_uri(id: &str, name: &str) -> String {
     format!("spotify:start-group:{id}:{}", encode_name(name))
@@ -61,12 +84,29 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// The id inside a marker URI, whichever end it is.
+fn marker_id(uri: &str) -> Option<&str> {
+    let rest = uri
+        .strip_prefix("spotify:start-group:")
+        .or_else(|| uri.strip_prefix("spotify:end-group:"))?;
+    Some(rest.split(':').next().unwrap_or(rest))
+}
+
+fn is_probe_uri(uri: &str, playlists: &[String]) -> bool {
+    match marker_id(uri) {
+        Some(id) => id.to_ascii_lowercase().contains(PREFIX),
+        None => playlists.iter().any(|held| held == uri),
+    }
+}
+
 struct Rootlist {
     revision: Vec<u8>,
     uris: Vec<String>,
     /// The item count the server declares for the whole list, markers included.
     declared: i32,
     reads: usize,
+    owner: String,
+    can_edit_items: Option<bool>,
 }
 
 impl Rootlist {
@@ -74,52 +114,91 @@ impl Rootlist {
         self.uris.iter().position(|held| held == uri)
     }
 
-    fn is_probe(&self, index: usize) -> bool {
-        self.uris
-            .get(index)
-            .is_some_and(|uri| uri.to_ascii_lowercase().contains(PREFIX))
+    /// The first marker URI whose id matches, whatever name or padding the
+    /// server chose to store.
+    fn find_marker(&self, id: &str, start: bool) -> Option<usize> {
+        let wanted = u64::from_str_radix(id, 16).ok()?;
+        self.uris.iter().position(|uri| {
+            let opens = uri.starts_with("spotify:start-group:");
+            if opens != start {
+                return false;
+            }
+            marker_id(uri)
+                .and_then(|held| u64::from_str_radix(held, 16).ok())
+                .is_some_and(|held| held == wanted)
+        })
     }
 
-    /// The tail from the first probe marker on: the only region any experiment
-    /// is allowed to name, printed compactly.
-    fn tail(&self) -> String {
-        let Some(first) = self
-            .uris
+    fn has_folder(&self, id: &str) -> bool {
+        self.find_marker(id, true).is_some()
+    }
+
+    /// One short symbol per item, so a head can be compared at a glance.
+    fn head(&self, count: usize, playlists: &[String]) -> String {
+        self.uris
             .iter()
-            .position(|uri| uri.to_ascii_lowercase().contains(PREFIX))
-        else {
-            return "(no probe items)".to_string();
-        };
-        self.uris[first..]
-            .iter()
-            .enumerate()
-            .map(|(offset, uri)| {
-                let label = match (
-                    uri.strip_prefix("spotify:start-group:"),
-                    uri.strip_prefix("spotify:end-group:"),
-                ) {
-                    (Some(rest), _) => format!("{}<", &rest[15..16]),
-                    (_, Some(rest)) => format!("{}>", &rest[15..16]),
-                    _ => "?".to_string(),
-                };
-                format!("{}:{label}", first + offset)
-            })
+            .take(count)
+            .map(|uri| label(uri, playlists))
             .collect::<Vec<_>>()
             .join(" ")
+    }
+}
+
+fn label(uri: &str, playlists: &[String]) -> String {
+    let name = |id: &str| match u64::from_str_radix(id, 16) {
+        Ok(value) if value == u64::from_str_radix(S1, 16).unwrap() => "S1".to_string(),
+        Ok(value) if value == u64::from_str_radix(S2, 16).unwrap() => "S2".to_string(),
+        Ok(value) if value == u64::from_str_radix(P, 16).unwrap() => "P".to_string(),
+        Ok(value) if value == u64::from_str_radix(Q, 16).unwrap() => "Q".to_string(),
+        Ok(value) if value == u64::from_str_radix(Z, 16).unwrap() => "Z".to_string(),
+        _ => format!("?{id}"),
+    };
+    if let Some(rest) = uri.strip_prefix("spotify:start-group:") {
+        return format!("{}<", name(rest.split(':').next().unwrap_or(rest)));
+    }
+    if let Some(rest) = uri.strip_prefix("spotify:end-group:") {
+        return format!(">{}", name(rest));
+    }
+    match playlists.iter().position(|held| held == uri) {
+        Some(index) => format!("X{}", index + 1),
+        None => ".".to_string(),
+    }
+}
+
+struct Ctx {
+    session: Session,
+    user: String,
+    http: reqwest::Client,
+    /// The Web API access token Fastpotify cached. The probe never refreshes
+    /// it: a refresh would rotate the token the running app still holds.
+    token: String,
+    /// The disposable playlists, in creation order.
+    playlists: Vec<String>,
+}
+
+impl Ctx {
+    fn playlist_id(&self, index: usize) -> &str {
+        self.playlists[index]
+            .rsplit(':')
+            .next()
+            .expect("a playlist uri")
     }
 }
 
 /// Reads the whole rootlist. The server honours a large `length`, so this is
 /// normally one request; the loop is there for a library big enough to be
 /// truncated anyway.
-async fn read(session: &Session) -> Result<Rootlist> {
+async fn read(ctx: &Ctx) -> Result<Rootlist> {
     const PAGE: usize = 2000;
     let mut uris: Vec<String> = Vec::new();
     let mut revision = Vec::new();
     let mut declared = 0;
     let mut reads = 0;
+    let mut owner = String::new();
+    let mut can_edit_items = None;
     loop {
-        let bytes = session
+        let bytes = ctx
+            .session
             .spclient()
             .get_rootlist(uris.len(), Some(PAGE))
             .await
@@ -136,15 +215,23 @@ async fn read(session: &Session) -> Result<Rootlist> {
             }
             revision = page.revision().to_vec();
             declared = page.length();
+            owner = page.owner_username().to_string();
+            can_edit_items = page
+                .capabilities
+                .as_ref()
+                .and_then(|caps| caps.can_edit_items);
         } else if page.revision() != revision.as_slice() {
             bail!("the revision changed while reading; start again");
         } else if page.length() != declared {
             bail!("the declared length changed while reading; start again");
         }
-        let contents = page
-            .contents
-            .as_ref()
-            .ok_or_else(|| anyhow!("rootlist page {reads} has no contents"))?;
+        let Some(contents) = page.contents.as_ref() else {
+            // An account with no playlists at all has nothing to page through.
+            if declared == 0 {
+                break;
+            }
+            bail!("rootlist page {reads} declared {declared} items but carried no contents");
+        };
         if contents.pos() != expected_pos {
             bail!(
                 "rootlist page {reads} starts at {}, expected {expected_pos}",
@@ -172,6 +259,8 @@ async fn read(session: &Session) -> Result<Rootlist> {
         uris,
         declared,
         reads,
+        owner,
+        can_edit_items,
     })
 }
 
@@ -182,6 +271,10 @@ fn print_tree(list: &Rootlist) {
         list.declared,
         list.reads,
         hex(&list.revision)
+    );
+    println!(
+        "owner_username {:?}, capabilities.can_edit_items {:?}",
+        list.owner, list.can_edit_items
     );
     let mut depth = 0usize;
     let mut folders = 0usize;
@@ -203,13 +296,15 @@ fn print_tree(list: &Rootlist) {
             println!("{index:>4}  {:indent$}{uri}", "", indent = depth * 2);
         }
     }
-    let kinds: std::collections::BTreeSet<_> = list
+    let kinds: BTreeSet<_> = list
         .uris
         .iter()
         .map(|uri| uri.split(':').nth(1).unwrap_or("?"))
         .collect();
     println!("{folders} folders, depth back to {depth}, item kinds {kinds:?}");
 }
+
+// --- operations ------------------------------------------------------------
 
 fn item(uri: &str) -> Item {
     let mut item = Item::new();
@@ -223,150 +318,391 @@ fn op(kind: Kind) -> Op {
     op
 }
 
-fn add(at: usize, uris: &[String]) -> Op {
-    let mut add = Add::new();
-    add.set_from_index(at as i32);
-    for uri in uris {
-        add.items.push(item(uri));
-    }
+fn wrap_add(add: Add) -> Op {
     let mut o = op(Kind::ADD);
     o.add = Some(add).into();
     o
 }
 
-fn rem(at: usize, uris: &[String]) -> Op {
-    let mut rem = Rem::new();
-    rem.set_from_index(at as i32);
-    rem.set_length(uris.len() as i32);
-    for uri in uris {
-        rem.items.push(item(uri));
-    }
+fn wrap_rem(rem: Rem) -> Op {
     let mut o = op(Kind::REM);
     o.rem = Some(rem).into();
     o
 }
 
-fn mov(from: usize, length: usize, to: usize) -> Op {
+fn wrap_mov(mov: Mov) -> Op {
+    let mut o = op(Kind::MOV);
+    o.mov = Some(mov).into();
+    o
+}
+
+fn items_of(uris: &[String]) -> Vec<Item> {
+    uris.iter().map(|uri| item(uri)).collect()
+}
+
+/// ADD by index, the form the first probe established.
+fn add_at(at: usize, uris: &[String]) -> Op {
+    let mut add = Add::new();
+    add.set_from_index(at as i32);
+    add.items = items_of(uris);
+    wrap_add(add)
+}
+
+fn rem_at(at: usize, length: usize) -> Op {
+    let mut rem = Rem::new();
+    rem.set_from_index(at as i32);
+    rem.set_length(length as i32);
+    wrap_rem(rem)
+}
+
+fn mov_at(from: usize, length: usize, to: usize) -> Op {
     let mut mov = Mov::new();
     mov.set_from_index(from as i32);
     mov.set_length(length as i32);
     mov.set_to_index(to as i32);
-    let mut o = op(Kind::MOV);
-    o.mov = Some(mov).into();
-    o
+    wrap_mov(mov)
 }
 
 fn folder(id: &str, name: &str) -> [String; 2] {
     [start_uri(id, name), end_uri(id)]
 }
 
-/// One change, exactly as the application would send it. The operations of a
-/// delta apply in order, so an op that shifts the list changes the indexes the
-/// ops after it see.
-async fn post(session: &Session, user: &str, base: &[u8], ops: Vec<Op>) -> String {
+// --- transport -------------------------------------------------------------
+
+/// What one POST told us. The probe speaks to the endpoint with reqwest rather
+/// than through `SpClient`, for three reasons: `SpClient` retries a failed
+/// request up to ten times, which would apply an ADD twice; its HTTP client
+/// sleeps and repeats on 429; and both hide the status code and the response
+/// body, which are half of what this probe is trying to record.
+struct Sent {
+    status: u16,
+    reply: Option<SelectedListContent>,
+    body: Vec<u8>,
+}
+
+impl Sent {
+    fn ok(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    fn verdict(&self) -> String {
+        if self.ok() {
+            "accepted".to_string()
+        } else {
+            format!("rejected {}", self.status)
+        }
+    }
+
+    /// Everything the reply carries that a client could synchronise from.
+    fn details(&self) -> String {
+        let Some(reply) = &self.reply else {
+            return format!("{} bytes, unparsed", self.body.len());
+        };
+        let mut parts = vec![format!("revision {}", hex(reply.revision()))];
+        if !reply.resulting_revisions.is_empty() {
+            parts.push(format!(
+                "resulting_revisions [{}]",
+                reply
+                    .resulting_revisions
+                    .iter()
+                    .map(|revision| hex(revision))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if let Some(diff) = reply.sync_result.as_ref() {
+            parts.push(format!(
+                "sync_result {} op(s) {}..{}",
+                diff.ops.len(),
+                hex(diff.from_revision()),
+                hex(diff.to_revision())
+            ));
+        }
+        if let Some(contents) = reply.contents.as_ref() {
+            parts.push(format!("contents {} item(s)", contents.items.len()));
+        }
+        for (name, value) in [
+            ("multiple_heads", reply.multiple_heads),
+            ("up_to_date", reply.up_to_date),
+            ("changes_require_resync", reply.changes_require_resync),
+        ] {
+            if let Some(value) = value {
+                parts.push(format!("{name} {value}"));
+            }
+        }
+        if !reply.nonces.is_empty() {
+            parts.push(format!("nonces {:?}", reply.nonces));
+        }
+        parts.join(", ")
+    }
+}
+
+fn changes(base: Option<&[u8]>, ops: Vec<Op>, nonce: Option<i64>) -> ListChanges {
     let mut delta = Delta::new();
     delta.ops = ops;
     let mut changes = ListChanges::new();
-    changes.set_base_revision(base.to_vec());
+    if let Some(base) = base {
+        changes.set_base_revision(base.to_vec());
+    }
     changes.deltas.push(delta);
-    let endpoint = format!("/playlist/v2/user/{user}/rootlist/changes");
-    match post_once(session, &endpoint, &changes).await {
-        Ok(_) => "accepted".to_string(),
-        Err(error) => format!("rejected ({error})"),
+    // Both flags are what Spotify's own web client sends, and they are the only
+    // way to see what the server decided it applied.
+    changes.set_want_resulting_revisions(true);
+    changes.set_want_sync_result(true);
+    if let Some(nonce) = nonce {
+        changes.nonces.push(nonce);
+    }
+    changes
+}
+
+/// Sends a mutation exactly once, as protobuf or as the JSON the web client
+/// uses. Nothing here retries: a lost response after Spotify applied an ADD
+/// would create the folder twice.
+async fn send(ctx: &Ctx, changes: &ListChanges, json: bool) -> Result<Sent> {
+    let base = ctx.session.spclient().base_url().await?;
+    let url = format!(
+        "{base}/playlist/v2/user/{}/rootlist/changes?product=0&country={}&salt={}",
+        ctx.user,
+        ctx.session.country(),
+        rand::random::<u32>()
+    );
+    let token = ctx.session.login5().auth_token().await?;
+    let (content_type, body) = if json {
+        let options = protobuf_json_mapping::PrintOptions {
+            // The captured web-client request carries `"kind":4`, not `"MOV"`.
+            enum_values_int: true,
+            ..Default::default()
+        };
+        let text = protobuf_json_mapping::print_to_string_with_options(changes, &options)?;
+        ("application/json", text.into_bytes())
+    } else {
+        ("application/x-protobuf", changes.write_to_bytes()?)
+    };
+    let mut request = ctx
+        .http
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, content_type)
+        .header(
+            reqwest::header::AUTHORIZATION,
+            format!("{} {}", token.token_type, token.access_token),
+        );
+    if let Ok(client_token) = ctx.session.spclient().client_token().await {
+        request = request.header("client-token", client_token);
+    }
+    let response = request.body(body).send().await?;
+    let status = response.status().as_u16();
+    let body = response.bytes().await?.to_vec();
+    let reply = SelectedListContent::parse_from_bytes(&body).ok();
+    Ok(Sent {
+        status,
+        reply,
+        body,
+    })
+}
+
+/// One change, sent once, reported in one line.
+async fn post(ctx: &Ctx, base: Option<&[u8]>, ops: Vec<Op>) -> Result<Sent> {
+    let sent = send(ctx, &changes(base, ops, None), false).await?;
+    println!("      POST {} ({})", sent.verdict(), sent.details());
+    Ok(sent)
+}
+
+// --- the Web API side ------------------------------------------------------
+
+async fn create_playlist(ctx: &Ctx, name: &str) -> Result<String> {
+    let response = ctx
+        .http
+        // `/v1/users/{id}/playlists` answers 403 for this client, the same
+        // way it does for Fastpotify, which posts to `/me/playlists` too.
+        .post("https://api.spotify.com/v1/me/playlists")
+        .bearer_auth(&ctx.token)
+        .json(&serde_json::json!({
+            "name": name,
+            "public": false,
+            "description": "Disposable item made by fastpotify's rootlist probe.",
+        }))
+        .send()
+        .await?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await?;
+    if !status.is_success() {
+        bail!("creating {name}: {status} {body}");
+    }
+    body.get("uri")
+        .and_then(|uri| uri.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("the create response carried no uri: {body}"))
+}
+
+/// Whether the playlist is still in the account's library. The obvious
+/// endpoint for this, `/playlists/{id}/followers/contains`, answers 403 for
+/// this client, so the check is the same list Fastpotify's sidebar reads.
+async fn follows(ctx: &Ctx, playlist_id: &str) -> Result<bool> {
+    let wanted = format!("spotify:playlist:{playlist_id}");
+    let mut url = "https://api.spotify.com/v1/me/playlists?limit=50".to_string();
+    loop {
+        let response = ctx.http.get(&url).bearer_auth(&ctx.token).send().await?;
+        let status = response.status();
+        let body: serde_json::Value = response.json().await?;
+        if !status.is_success() {
+            bail!("listing the library: {status} {body}");
+        }
+        let items = body
+            .get("items")
+            .and_then(|items| items.as_array())
+            .ok_or_else(|| anyhow!("no items in the library page: {body}"))?;
+        if items
+            .iter()
+            .filter_map(|item| item.get("uri").and_then(|uri| uri.as_str()))
+            .any(|uri| uri == wanted)
+        {
+            return Ok(true);
+        }
+        match body.get("next").and_then(|next| next.as_str()) {
+            Some(next) => url = next.to_string(),
+            None => return Ok(false),
+        }
     }
 }
 
-/// Sends a mutation once. `SpClient::request_with_protobuf` retries network
-/// failures up to ten times, which is unsafe for an ADD when the first reply
-/// was lost after Spotify applied it. The underlying HTTP client only repeats
-/// an explicit 429 response, where Spotify rejected the request before asking
-/// the client to wait.
-async fn post_once(session: &Session, endpoint: &str, changes: &ListChanges) -> Result<()> {
-    let body = changes.write_to_bytes()?;
-    let base = session.spclient().base_url().await?;
-    let url = format!(
-        "{base}{endpoint}?product=0&country={}&salt={}",
-        session.country(),
-        rand::random::<u32>()
-    );
-    let token = session.login5().auth_token().await?;
-    let mut request = http::Request::builder()
-        .method(http::Method::POST)
-        .uri(url)
-        .header(http::header::CONTENT_TYPE, "application/x-protobuf")
-        .header(http::header::CONTENT_LENGTH, body.len())
-        .header(
-            http::header::AUTHORIZATION,
-            format!("{} {}", token.token_type, token.access_token),
-        );
-    if let Ok(client_token) = session.spclient().client_token().await {
-        request = request.header("client-token", client_token);
+async fn unfollow(ctx: &Ctx, playlist_id: &str) -> Result<()> {
+    let response = ctx
+        .http
+        .delete(format!(
+            "https://api.spotify.com/v1/playlists/{playlist_id}/followers"
+        ))
+        .bearer_auth(&ctx.token)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        bail!("unfollowing {playlist_id}: {}", response.status());
     }
-    let request = request.body(body.into())?;
-    session.http_client().request_body(request).await?;
     Ok(())
 }
 
-/// Removes every folder this probe ever created, in balanced marker pairs.
-async fn clean(session: &Session, user: &str) -> Result<()> {
+// --- arranging a safe head -------------------------------------------------
+
+/// What the head of the rootlist should hold while an experiment runs.
+#[derive(Clone, Copy)]
+enum Slot {
+    /// A folder the probe creates, empty unless a child follows it.
+    Folder(&'static str, &'static str),
+    /// A folder that closes after the slots nested inside it.
+    Open(&'static str, &'static str),
+    Close,
+    /// One of the disposable playlists, by creation order.
+    Playlist(usize),
+}
+
+/// Removes every folder the probe ever created, in balanced marker pairs.
+async fn clean(ctx: &Ctx) -> Result<()> {
     loop {
-        let list = read(session).await?;
-        // Group ids are case insensitive, so the search has to be too.
-        let Some(start) = list.uris.iter().position(|uri| {
-            uri.to_ascii_lowercase()
-                .starts_with(&format!("spotify:start-group:{PREFIX}"))
-        }) else {
+        let list = read(ctx).await?;
+        let Some(start) = list
+            .uris
+            .iter()
+            .position(|uri| uri.starts_with("spotify:start-group:") && is_probe_uri(uri, &[]))
+        else {
             return Ok(());
         };
-        let id = list.uris[start]["spotify:start-group:".len()..]
-            .split(':')
-            .next()
-            .unwrap_or_default()
-            .to_string();
+        let id = marker_id(&list.uris[start]).unwrap_or_default().to_string();
         let end = list
             .index_of(&end_uri(&id))
-            .ok_or_else(|| anyhow!("folder {id} has no end marker"))?;
-        if !list.is_probe(start) || !list.is_probe(end) {
+            .ok_or_else(|| anyhow!("probe folder {id} has no end marker"))?;
+        if !is_probe_uri(&list.uris[start], &[]) || !is_probe_uri(&list.uris[end], &[]) {
             bail!("refusing to remove an index that is not a probe marker");
         }
-        // The server refuses a delta that leaves the group markers unbalanced,
-        // so both go in one request, the later index first.
-        let outcome = post(
-            session,
-            user,
-            &list.revision,
-            vec![
-                rem(end, &[end_uri(&id)]),
-                rem(start, &[list.uris[start].clone()]),
-            ],
+        // The server refuses a delta that leaves the markers unbalanced, so
+        // both go in one request, the later index first. Anything the folder
+        // held stays in the list, one level further out.
+        let sent = post(
+            ctx,
+            Some(&list.revision),
+            vec![rem_at(end, 1), rem_at(start, 1)],
         )
-        .await;
-        if outcome != "accepted" {
-            bail!("cleanup {outcome}");
+        .await?;
+        if !sent.ok() {
+            bail!("cleanup {}", sent.verdict());
         }
-        println!("  removed folder {id} at {start}..={end}");
     }
 }
 
-/// Leaves exactly two empty probe folders, adjacent, at the end of the list.
-async fn reset(session: &Session, user: &str) -> Result<Rootlist> {
-    clean(session, user).await?;
-    let list = read(session).await?;
-    let at = list.uris.len();
-    let outcome = post(
-        session,
-        user,
-        &list.revision,
-        vec![
-            add(at, &folder(P, "probe a")),
-            add(at + 2, &folder(Q, "probe b")),
-        ],
-    )
-    .await;
-    if outcome != "accepted" {
-        bail!("setup {outcome}");
+/// Builds the head of the rootlist out of probe-owned items, one request per
+/// slot so every index is taken from a fresh snapshot. Slots land in order, so
+/// slot zero is whatever a fallback coordinate would destroy.
+async fn arrange(ctx: &Ctx, slots: &[Slot]) -> Result<Rootlist> {
+    clean(ctx).await?;
+    let mut placed = 0usize;
+    for slot in slots {
+        let list = read(ctx).await?;
+        match *slot {
+            Slot::Folder(id, name) => {
+                let sent = post(
+                    ctx,
+                    Some(&list.revision),
+                    vec![add_at(placed, &folder(id, name))],
+                )
+                .await?;
+                if !sent.ok() {
+                    bail!("arranging folder {id}: {}", sent.verdict());
+                }
+                placed += 2;
+            }
+            Slot::Open(id, name) => {
+                let sent = post(
+                    ctx,
+                    Some(&list.revision),
+                    vec![add_at(placed, &folder(id, name))],
+                )
+                .await?;
+                if !sent.ok() {
+                    bail!("arranging folder {id}: {}", sent.verdict());
+                }
+                placed += 1;
+            }
+            Slot::Close => {
+                // The end marker is already in place from `Open`; the slots in
+                // between were inserted before it.
+                placed += 1;
+            }
+            Slot::Playlist(which) => {
+                let uri = ctx.playlists[which].clone();
+                let from = list
+                    .index_of(&uri)
+                    .ok_or_else(|| anyhow!("disposable playlist {uri} is not in the rootlist"))?;
+                if from != placed {
+                    let sent =
+                        post(ctx, Some(&list.revision), vec![mov_at(from, 1, placed)]).await?;
+                    if !sent.ok() {
+                        bail!("arranging playlist {uri}: {}", sent.verdict());
+                    }
+                }
+                placed += 1;
+            }
+        }
     }
-    read(session).await
+    let list = read(ctx).await?;
+    assert_head_is_disposable(ctx, &list, placed)?;
+    println!(
+        "    head {} | {placed} probe items",
+        list.head(placed, &ctx.playlists)
+    );
+    Ok(list)
+}
+
+/// The guard every experiment leans on: nothing an operation can reach by
+/// falling back to the front of the list belongs to the real library.
+fn assert_head_is_disposable(ctx: &Ctx, list: &Rootlist, count: usize) -> Result<()> {
+    for index in 0..count {
+        let uri = list
+            .uris
+            .get(index)
+            .ok_or_else(|| anyhow!("the rootlist is shorter than the arranged head"))?;
+        if !is_probe_uri(uri, &ctx.playlists) {
+            bail!("item {index} is {uri}, which the probe does not own; refusing to write");
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -397,10 +733,23 @@ async fn main() -> Result<()> {
     let user = session.username();
     println!("session.username() = {user}   (the account id the Web API also reports)");
 
-    let baseline = read(&session).await?;
+    let token = if arg("--write") {
+        read_web_token(&state)?
+    } else {
+        String::new()
+    };
+    let mut ctx = Ctx {
+        session,
+        user: user.clone(),
+        http: reqwest::Client::new(),
+        token,
+        playlists: Vec::new(),
+    };
+
+    let baseline = read(&ctx).await?;
 
     if arg("--clean") {
-        clean(&session, &user).await?;
+        clean(&ctx).await?;
         println!("clean");
         return Ok(());
     }
@@ -410,20 +759,101 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let outcome = experiments(&session, &user).await;
-    clean(&session, &user).await?;
-    let after = read(&session).await?;
+    println!("\n### disposable playlists");
+    for name in ["fastpotify probe 1", "fastpotify probe 2"] {
+        let uri = create_playlist(&ctx, name).await?;
+        let list = read(&ctx).await?;
+        println!(
+            "  created {uri}; the rootlist now holds it at {:?}",
+            list.index_of(&uri)
+        );
+        ctx.playlists.push(uri);
+    }
+
+    let outcome = experiments(&ctx).await;
+
+    println!("\n### teardown");
+    clean(&ctx).await?;
+    for index in 0..ctx.playlists.len() {
+        let id = ctx.playlist_id(index).to_string();
+        match unfollow(&ctx, &id).await {
+            Ok(()) => println!("  unfollowed {}", ctx.playlists[index]),
+            Err(error) => println!("  could not unfollow {}: {error}", ctx.playlists[index]),
+        }
+    }
+    let after = read(&ctx).await?;
     println!(
         "\n=== library restored: {} ===",
-        after.uris == baseline.uris
+        if after.uris == baseline.uris {
+            "yes".to_string()
+        } else {
+            format!(
+                "NO, {} items against {}",
+                after.uris.len(),
+                baseline.uris.len()
+            )
+        }
     );
     outcome
 }
 
-async fn experiments(session: &Session, user: &str) -> Result<()> {
-    println!("\n### how much comes back in one request");
+fn read_web_token(state: &std::path::Path) -> Result<String> {
+    let path = state.join("personal_web_api_token.json");
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&text)?;
+    let expires_at = value
+        .get("expires_at")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    if expires_at <= now {
+        bail!(
+            "the cached Web API token expired {} seconds ago; open Fastpotify so it refreshes one \
+             (the probe must not refresh it itself, that would rotate the token the app holds)",
+            now - expires_at
+        );
+    }
+    value
+        .get("access_token")
+        .and_then(|token| token.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("no access_token in {}", path.display()))
+}
+
+async fn experiments(ctx: &Ctx) -> Result<()> {
+    // `--only <name>` reruns one section after a fix.
+    let mut args = std::env::args().skip_while(|arg| arg != "--only");
+    if args.next().is_some() {
+        return match args.next().as_deref() {
+            Some("playlists") => playlist_semantics(ctx).await,
+            Some("anchors") => move_anchors(ctx).await,
+            Some("nonces") => nonces(ctx).await,
+            Some("revisions") => revisions(ctx).await,
+            other => bail!("no experiment section called {other:?}"),
+        };
+    }
+    read_facts(ctx).await?;
+    add_anchors(ctx).await?;
+    rename_addressing(ctx).await?;
+    move_addressing(ctx).await?;
+    move_anchors(ctx).await?;
+    remove_addressing(ctx).await?;
+    revisions(ctx).await?;
+    nonces(ctx).await?;
+    ids_and_names(ctx).await?;
+    playlist_semantics(ctx).await?;
+    Ok(())
+}
+
+// --- experiments -----------------------------------------------------------
+
+async fn read_facts(ctx: &Ctx) -> Result<()> {
+    println!("\n### what one read returns");
     for wanted in [100usize, 500, 5000] {
-        match session.spclient().get_rootlist(0, Some(wanted)).await {
+        match ctx.session.spclient().get_rootlist(0, Some(wanted)).await {
             Ok(bytes) => {
                 let page = SelectedListContent::parse_from_bytes(&bytes)?;
                 println!(
@@ -436,7 +866,433 @@ async fn experiments(session: &Session, user: &str) -> Result<()> {
             Err(error) => println!("  asked {wanted:<5} error {error}"),
         }
     }
+    let list = read(ctx).await?;
+    println!(
+        "  owner_username {:?}, can_edit_items {:?}",
+        list.owner, list.can_edit_items
+    );
+    Ok(())
+}
 
+async fn add_anchors(ctx: &Ctx) -> Result<()> {
+    println!("\n### ADD: can the destination be an item instead of an index?");
+    // ADD destroys nothing, so this is the safe place to learn whether the
+    // server reads anchors at all before any destructive form is tried.
+    for (name, build) in add_forms() {
+        let list = arrange(ctx, &[Slot::Folder(P, "target")]).await?;
+        let sent = post(ctx, Some(&list.revision), vec![build(&list)]).await?;
+        let after = read(ctx).await?;
+        let landed = after.find_marker(Q, true);
+        let inside = landed == after.find_marker(P, true).map(|start| start + 1);
+        println!(
+            "  {name:<28} {}; Q at {landed:?}, first child of P {inside}, head {}",
+            sent.verdict(),
+            after.head(6, &ctx.playlists)
+        );
+    }
+    Ok(())
+}
+
+/// One named way of writing an operation, built against a fresh snapshot.
+type Form = (&'static str, fn(&Rootlist) -> Op);
+
+fn add_forms() -> Vec<Form> {
+    vec![
+        ("from_index (control)", |list| {
+            let start = list.find_marker(P, true).unwrap_or(0);
+            add_at(start + 1, &folder(Q, "anchored"))
+        }),
+        ("add_after_item, no index", |list| {
+            let mut add = Add::new();
+            add.items = items_of(&folder(Q, "anchored"));
+            add.add_after_item =
+                Some(item(&list.uris[list.find_marker(P, true).unwrap_or(0)])).into();
+            wrap_add(add)
+        }),
+        ("add_before_item, no index", |list| {
+            let mut add = Add::new();
+            add.items = items_of(&folder(Q, "anchored"));
+            let end = list.find_marker(P, false).unwrap_or(0);
+            add.add_before_item = Some(item(&list.uris[end])).into();
+            wrap_add(add)
+        }),
+        ("add_first, no index", |_| {
+            let mut add = Add::new();
+            add.items = items_of(&folder(Q, "anchored"));
+            add.set_add_first(true);
+            wrap_add(add)
+        }),
+        ("add_last, no index", |_| {
+            let mut add = Add::new();
+            add.items = items_of(&folder(Q, "anchored"));
+            add.set_add_last(true);
+            wrap_add(add)
+        }),
+        ("items only, nothing else", |_| {
+            let mut add = Add::new();
+            add.items = items_of(&folder(Q, "anchored"));
+            wrap_add(add)
+        }),
+    ]
+}
+
+async fn rename_addressing(ctx: &Ctx) -> Result<()> {
+    println!("\n### UPDATE_ITEM_URIS: index, item, or both?");
+    // S1 sits at index zero, so a form that falls back to index zero renames a
+    // sacrificial marker instead of a real playlist's URI.
+    let forms: Vec<Form> = vec![
+        ("index and item (control)", |list| {
+            let start = list.find_marker(P, true).unwrap();
+            update(
+                Some(start),
+                Some(&list.uris[start]),
+                &start_uri(P, "renamed"),
+            )
+        }),
+        ("item only, no index", |list| {
+            let start = list.find_marker(P, true).unwrap();
+            update(None, Some(&list.uris[start]), &start_uri(P, "renamed"))
+        }),
+        ("index only, no item", |list| {
+            let start = list.find_marker(P, true).unwrap();
+            update(Some(start), None, &start_uri(P, "renamed"))
+        }),
+        ("P's item at S1's index", |list| {
+            let start = list.find_marker(P, true).unwrap();
+            update(Some(0), Some(&list.uris[start]), &start_uri(P, "renamed"))
+        }),
+    ];
+    for (name, build) in forms {
+        let list = arrange(
+            ctx,
+            &[Slot::Folder(S1, "sacrifice"), Slot::Folder(P, "target")],
+        )
+        .await?;
+        let sacrifice_before = list.uris[0].clone();
+        let sent = post(ctx, Some(&list.revision), vec![build(&list)]).await?;
+        let after = read(ctx).await?;
+        let renamed = after.index_of(&start_uri(P, "renamed")).is_some();
+        let sacrifice_hit = after.uris.first() != Some(&sacrifice_before);
+        println!(
+            "  {name:<26} {}; P renamed {renamed}, sacrifice touched {sacrifice_hit}",
+            sent.verdict()
+        );
+    }
+    Ok(())
+}
+
+fn update(index: Option<usize>, from: Option<&str>, new_uri: &str) -> Op {
+    let mut replacement = UriReplacement::new();
+    if let Some(index) = index {
+        replacement.set_index(index as i32);
+    }
+    if let Some(from) = from {
+        replacement.item = Some(item(from)).into();
+    }
+    replacement.set_new_uri(new_uri.to_string());
+    let mut update = UpdateItemUris::new();
+    update.uri_replacements.push(replacement);
+    let mut o = op(Kind::UPDATE_ITEM_URIS);
+    o.update_item_uris = Some(update).into();
+    o
+}
+
+async fn move_addressing(ctx: &Ctx) -> Result<()> {
+    println!("\n### MOV: a playlist into a folder, by items or by index");
+    // X1 is the sacrifice at index zero: one item, matching the length of the
+    // move being tested. X2 is what an identity-addressed move should carry.
+    for (name, json) in [("protobuf", false), ("json, the captured form", true)] {
+        let list = arrange(
+            ctx,
+            &[
+                Slot::Playlist(0),
+                Slot::Playlist(1),
+                Slot::Folder(P, "destination"),
+            ],
+        )
+        .await?;
+        let start = list.find_marker(P, true).unwrap();
+        let mut mov = Mov::new();
+        mov.items = items_of(&[ctx.playlists[1].clone()]);
+        mov.add_after_item = Some(item(&list.uris[start])).into();
+        let sent = send(
+            ctx,
+            &changes(Some(&list.revision), vec![wrap_mov(mov)], None),
+            json,
+        )
+        .await?;
+        println!("      POST {} ({})", sent.verdict(), sent.details());
+        let after = read(ctx).await?;
+        let inside =
+            after.find_marker(P, true).map(|start| start + 1) == after.index_of(&ctx.playlists[1]);
+        println!(
+            "  items + add_after_item, {name:<24} {}; X2 inside P {inside}, X1 moved {}, head {}",
+            sent.verdict(),
+            after.index_of(&ctx.playlists[0]) != Some(0),
+            after.head(6, &ctx.playlists)
+        );
+    }
+
+    println!("\n### MOV: a whole folder span by its items");
+    let list = arrange(
+        ctx,
+        &[
+            Slot::Folder(S1, "sacrifice"),
+            Slot::Folder(Q, "moved"),
+            Slot::Folder(P, "destination"),
+        ],
+    )
+    .await?;
+    let q_start = list.find_marker(Q, true).unwrap();
+    let q_end = list.find_marker(Q, false).unwrap();
+    let p_start = list.find_marker(P, true).unwrap();
+    let mut mov = Mov::new();
+    mov.items = items_of(&[list.uris[q_start].clone(), list.uris[q_end].clone()]);
+    mov.add_after_item = Some(item(&list.uris[p_start])).into();
+    let sent = post(ctx, Some(&list.revision), vec![wrap_mov(mov)]).await?;
+    let after = read(ctx).await?;
+    println!(
+        "  folder span by items: {}; head {}",
+        sent.verdict(),
+        after.head(6, &ctx.playlists)
+    );
+
+    println!("\n### MOV: how to_index is counted");
+    for offset in [0i32, 1, -1] {
+        let list = arrange(
+            ctx,
+            &[Slot::Folder(S1, "sacrifice"), Slot::Folder(P, "moved")],
+        )
+        .await?;
+        let from = list.find_marker(P, true).unwrap();
+        let to = (from as i32 + offset).max(0) as usize;
+        let sent = post(ctx, Some(&list.revision), vec![mov_at(from, 2, to)]).await?;
+        let after = read(ctx).await?;
+        println!(
+            "  from {from} length 2 to_index {to}: {}; head {}",
+            sent.verdict(),
+            after.head(6, &ctx.playlists)
+        );
+    }
+    Ok(())
+}
+
+async fn remove_addressing(ctx: &Ctx) -> Result<()> {
+    println!("\n### REM: does items_as_key make the items decide?");
+    let forms: Vec<Form> = vec![
+        ("index and length (control)", |list| {
+            rem_at(list.find_marker(P, true).unwrap(), 2)
+        }),
+        ("items_as_key, index at S1", |list| {
+            let start = list.find_marker(P, true).unwrap();
+            let mut rem = Rem::new();
+            rem.set_items_as_key(true);
+            rem.set_from_index(0);
+            rem.set_length(2);
+            rem.items = items_of(&[list.uris[start].clone(), list.uris[start + 1].clone()]);
+            wrap_rem(rem)
+        }),
+        ("items_as_key, no index", |list| {
+            let start = list.find_marker(P, true).unwrap();
+            let mut rem = Rem::new();
+            rem.set_items_as_key(true);
+            rem.items = items_of(&[list.uris[start].clone(), list.uris[start + 1].clone()]);
+            wrap_rem(rem)
+        }),
+        ("items only, no flag, no index", |list| {
+            let start = list.find_marker(P, true).unwrap();
+            let mut rem = Rem::new();
+            rem.items = items_of(&[list.uris[start].clone(), list.uris[start + 1].clone()]);
+            wrap_rem(rem)
+        }),
+    ];
+    for (name, build) in forms {
+        // The sacrifice is a balanced two-item span, the same length as the
+        // folder being removed, so an index-zero fallback is both survivable
+        // and visible.
+        let list = arrange(
+            ctx,
+            &[Slot::Folder(S1, "sacrifice"), Slot::Folder(P, "target")],
+        )
+        .await?;
+        let sent = post(ctx, Some(&list.revision), vec![build(&list)]).await?;
+        let after = read(ctx).await?;
+        println!(
+            "  {name:<30} {}; P gone {}, S1 gone {}, head {}",
+            sent.verdict(),
+            !after.has_folder(P),
+            !after.has_folder(S1),
+            after.head(6, &ctx.playlists)
+        );
+    }
+    Ok(())
+}
+
+async fn revisions(ctx: &Ctx) -> Result<()> {
+    println!("\n### base_revision");
+    let list = arrange(
+        ctx,
+        &[Slot::Folder(S1, "sacrifice"), Slot::Folder(P, "target")],
+    )
+    .await?;
+    let start = list.find_marker(P, true).unwrap();
+    let sent = post(ctx, None, vec![rem_at(start, 2)]).await?;
+    let after = read(ctx).await?;
+    println!(
+        "  omitted entirely, index form: {}; P gone {}",
+        sent.verdict(),
+        !after.has_folder(P)
+    );
+
+    let list = arrange(
+        ctx,
+        &[Slot::Folder(S1, "sacrifice"), Slot::Folder(P, "target")],
+    )
+    .await?;
+    let start = list.find_marker(P, true).unwrap();
+    let mut rem = Rem::new();
+    rem.set_items_as_key(true);
+    rem.items = items_of(&[list.uris[start].clone(), list.uris[start + 1].clone()]);
+    let sent = post(ctx, None, vec![wrap_rem(rem)]).await?;
+    let after = read(ctx).await?;
+    println!(
+        "  omitted entirely, identity form: {}; P gone {}",
+        sent.verdict(),
+        !after.has_folder(P)
+    );
+
+    let list = arrange(
+        ctx,
+        &[Slot::Folder(S1, "sacrifice"), Slot::Folder(P, "target")],
+    )
+    .await?;
+    let start = list.find_marker(P, true).unwrap();
+    let garbage = vec![0u8; list.revision.len()];
+    let sent = post(ctx, Some(&garbage), vec![rem_at(start, 2)]).await?;
+    println!("  a revision the server never issued: {}", sent.verdict());
+
+    // A stale revision with an index taken from a newer snapshot. Both the
+    // stale and the fresh index have to point inside probe territory for this
+    // to be safe, which the arrangement and the guard below guarantee.
+    let list = arrange(
+        ctx,
+        &[
+            Slot::Folder(S1, "sacrifice"),
+            Slot::Folder(P, "first"),
+            Slot::Folder(Q, "second"),
+        ],
+    )
+    .await?;
+    let stale = list.revision.clone();
+    let p_start = list.find_marker(P, true).unwrap();
+    let q_start = list.find_marker(Q, true).unwrap();
+    let sent = post(ctx, Some(&list.revision), vec![mov_at(q_start, 2, p_start)]).await?;
+    if !sent.ok() {
+        bail!("could not swap the two probe folders: {}", sent.verdict());
+    }
+    let swapped = read(ctx).await?;
+    let fresh = swapped.find_marker(P, true).unwrap();
+    assert_head_is_disposable(ctx, &swapped, 6)?;
+    if fresh + 1 >= 6 {
+        bail!("the swapped layout left probe territory");
+    }
+    let sent = post(ctx, Some(&stale), vec![rem_at(fresh, 2)]).await?;
+    let after = read(ctx).await?;
+    println!(
+        "  fresh index {fresh} with a stale revision: {}; P gone {}, Q gone {}, head {}",
+        sent.verdict(),
+        !after.has_folder(P),
+        !after.has_folder(Q),
+        after.head(6, &ctx.playlists)
+    );
+    Ok(())
+}
+
+async fn nonces(ctx: &Ctx) -> Result<()> {
+    println!("\n### nonces: does Spotify drop a repeated change?");
+    // The control first: the same ADD twice with no nonce at all. If Spotify
+    // refuses the second one by itself, a deduplicated nonce would prove
+    // nothing.
+    let list = arrange(ctx, &[Slot::Folder(S1, "sacrifice")]).await?;
+    let body = changes(
+        Some(&list.revision),
+        vec![add_at(0, &folder(P, "twice"))],
+        None,
+    );
+    let first = send(ctx, &body, false).await?;
+    let second = send(ctx, &body, false).await?;
+    let after = read(ctx).await?;
+    println!(
+        "  no nonce, sent twice: {} then {}; P present {}, start markers {}",
+        first.verdict(),
+        second.verdict(),
+        after.has_folder(P),
+        after
+            .uris
+            .iter()
+            .filter(|uri| uri.starts_with(&format!("spotify:start-group:{P}")))
+            .count()
+    );
+
+    let list = arrange(ctx, &[Slot::Folder(S1, "sacrifice")]).await?;
+    let nonce = rand::random::<i32>() as i64;
+    let body = changes(
+        Some(&list.revision),
+        vec![add_at(0, &folder(P, "twice"))],
+        Some(nonce),
+    );
+    let first = send(ctx, &body, false).await?;
+    let second = send(ctx, &body, false).await?;
+    let after = read(ctx).await?;
+    let copies = after
+        .uris
+        .iter()
+        .filter(|uri| uri.starts_with(&format!("spotify:start-group:{P}")))
+        .count();
+    println!(
+        "  nonce {nonce}, sent twice: {} then {}; start markers for P {copies}",
+        first.verdict(),
+        second.verdict()
+    );
+    println!("    first reply  {}", first.details());
+    println!("    second reply {}", second.details());
+
+    // And a replay after the list moved on, which is the case a lost response
+    // would produce in the wild.
+    let list = arrange(ctx, &[Slot::Folder(S1, "sacrifice")]).await?;
+    let nonce = rand::random::<i32>() as i64;
+    let body = changes(
+        Some(&list.revision),
+        vec![add_at(0, &folder(P, "replay"))],
+        Some(nonce),
+    );
+    let first = send(ctx, &body, false).await?;
+    let between = read(ctx).await?;
+    let sent = post(
+        ctx,
+        Some(&between.revision),
+        vec![add_at(0, &folder(Q, "between"))],
+    )
+    .await?;
+    if !sent.ok() {
+        bail!("could not make an unrelated change: {}", sent.verdict());
+    }
+    let replay = send(ctx, &body, false).await?;
+    let after = read(ctx).await?;
+    let copies = after
+        .uris
+        .iter()
+        .filter(|uri| uri.starts_with(&format!("spotify:start-group:{P}")))
+        .count();
+    println!(
+        "  nonce replayed after another change: {} then {}; start markers for P {copies}",
+        first.verdict(),
+        replay.verdict()
+    );
+    Ok(())
+}
+
+async fn ids_and_names(ctx: &Ctx) -> Result<()> {
     println!("\n### which folder ids the server accepts");
     for candidate in [
         "fa57007ffee1d0cc",
@@ -445,301 +1301,350 @@ async fn experiments(session: &Session, user: &str) -> Result<()> {
         "fa57007ffee1d0ccc",
         "fa57007ffee1d0-x",
     ] {
-        let list = read(session).await?;
-        let outcome = post(
-            session,
-            user,
-            &list.revision,
-            vec![add(list.uris.len(), &folder(candidate, "id test"))],
+        let list = arrange(ctx, &[Slot::Folder(S1, "sacrifice")]).await?;
+        let sent = post(
+            ctx,
+            Some(&list.revision),
+            vec![add_at(0, &folder(candidate, "id test"))],
         )
-        .await;
-        println!("  {candidate:<18} {outcome}");
-        clean(session, user).await?;
-    }
-
-    println!("\n### unicode, spaces and punctuation in a folder name");
-    let name = "probe ünïcode +plus %pct";
-    let list = read(session).await?;
-    post(
-        session,
-        user,
-        &list.revision,
-        vec![add(list.uris.len(), &folder(P, name))],
-    )
-    .await;
-    let list = read(session).await?;
-    match list.index_of(&start_uri(P, name)) {
-        Some(index) => println!(
-            "  round trip at {index}: {:?}",
-            decode_name(&list.uris[index][format!("spotify:start-group:{P}:").len()..])
-        ),
-        None => println!("  the name did not survive: {}", list.tail()),
-    }
-
-    println!("\n### rename: UPDATE_ITEM_URIS on the start marker alone");
-    let list = read(session).await?;
-    let start = list
-        .index_of(&start_uri(P, name))
-        .ok_or_else(|| anyhow!("probe folder missing"))?;
-    // A child, so the rename can be shown not to disturb the contents.
-    post(
-        session,
-        user,
-        &list.revision,
-        vec![add(start + 1, &folder(Q, "child"))],
-    )
-    .await;
-    let list = read(session).await?;
-    let start = list.index_of(&start_uri(P, name)).unwrap();
-    let mut replacement = UriReplacement::new();
-    replacement.set_index(start as i32);
-    replacement.item = Some(item(&start_uri(P, name))).into();
-    replacement.set_new_uri(start_uri(P, "probe renamed"));
-    let mut update = UpdateItemUris::new();
-    update.uri_replacements.push(replacement);
-    let mut o = op(Kind::UPDATE_ITEM_URIS);
-    o.update_item_uris = Some(update).into();
-    let outcome = post(session, user, &list.revision, vec![o]).await;
-    let list = read(session).await?;
-    let renamed = list.index_of(&start_uri(P, "probe renamed"));
-    println!(
-        "  {outcome}; renamed {}, child still inside {}",
-        renamed.is_some(),
-        list.index_of(&start_uri(Q, "child")) == renamed.map(|index| index + 1),
-    );
-
-    println!("\n### does the server read Op.items, or only the indexes?");
-    let list = reset(session, user).await?;
-    println!("  layout {}", list.tail());
-    let q_start = list.index_of(&start_uri(Q, "probe b")).unwrap();
-    let outcome = post(
-        session,
-        user,
-        &list.revision,
-        vec![rem(q_start, &folder(P, "probe a"))],
-    )
-    .await;
-    let after = read(session).await?;
-    println!(
-        "  REM at b's index carrying a's items: {outcome}; a present {}, b present {}",
-        after.index_of(&start_uri(P, "probe a")).is_some(),
-        after.index_of(&start_uri(Q, "probe b")).is_some(),
-    );
-
-    let list = reset(session, user).await?;
-    let p_start = list.index_of(&start_uri(P, "probe a")).unwrap();
-    let mut bare = Rem::new();
-    bare.set_from_index(p_start as i32);
-    bare.set_length(2);
-    let mut o = op(Kind::REM);
-    o.rem = Some(bare).into();
-    let outcome = post(session, user, &list.revision, vec![o]).await;
-    let after = read(session).await?;
-    println!(
-        "  REM by index with no items at all: {outcome}; a present {}",
-        after.index_of(&start_uri(P, "probe a")).is_some(),
-    );
-
-    println!("\n### does MOV read its items, or only from_index?");
-    let list = reset(session, user).await?;
-    println!("  layout {}", list.tail());
-    let p_start = list.index_of(&start_uri(P, "probe a")).unwrap();
-    let q_start = list.index_of(&start_uri(Q, "probe b")).unwrap();
-    // Move b to the front while carrying a's items. If the items decided, a
-    // would move to the index it already holds and nothing would change.
-    let mut m = Mov::new();
-    m.set_from_index(q_start as i32);
-    m.set_length(2);
-    m.set_to_index(p_start as i32);
-    m.items.push(item(&start_uri(P, "probe a")));
-    m.items.push(item(&end_uri(P)));
-    let mut o = op(Kind::MOV);
-    o.mov = Some(m).into();
-    let outcome = post(session, user, &list.revision, vec![o]).await;
-    let after = read(session).await?;
-    println!(
-        "  MOV of b's span carrying a's items: {outcome}; {}   b now at {:?}",
-        after.tail(),
-        after.index_of(&start_uri(Q, "probe b")),
-    );
-
-    println!("\n### does UPDATE_ITEM_URIS need its item?");
-    let list = reset(session, user).await?;
-    let p_start = list.index_of(&start_uri(P, "probe a")).unwrap();
-    // The index alone, with no item travelling beside it.
-    let mut replacement = UriReplacement::new();
-    replacement.set_index(p_start as i32);
-    replacement.set_new_uri(start_uri(P, "renamed by index alone"));
-    let mut update = UpdateItemUris::new();
-    update.uri_replacements.push(replacement);
-    let mut o = op(Kind::UPDATE_ITEM_URIS);
-    o.update_item_uris = Some(update).into();
-    let outcome = post(session, user, &list.revision, vec![o]).await;
-    let after = read(session).await?;
-    println!(
-        "  index alone, no item: {outcome}; a renamed {}",
-        after
-            .index_of(&start_uri(P, "renamed by index alone"))
-            .is_some(),
-    );
-
-    // The right item at the wrong index. If the item won, a would be renamed.
-    let list = reset(session, user).await?;
-    let q_start = list.index_of(&start_uri(Q, "probe b")).unwrap();
-    let mut replacement = UriReplacement::new();
-    replacement.set_index(q_start as i32);
-    replacement.item = Some(item(&start_uri(P, "probe a"))).into();
-    replacement.set_new_uri(start_uri(P, "renamed by item"));
-    let mut update = UpdateItemUris::new();
-    update.uri_replacements.push(replacement);
-    let mut o = op(Kind::UPDATE_ITEM_URIS);
-    o.update_item_uris = Some(update).into();
-    let outcome = post(session, user, &list.revision, vec![o]).await;
-    let after = read(session).await?;
-    println!(
-        "  a's item at b's index: {outcome}; a renamed {}, b untouched {}",
-        after.index_of(&start_uri(P, "renamed by item")).is_some(),
-        after.index_of(&start_uri(Q, "probe b")).is_some(),
-    );
-
-    // And a mismatch the other way round: the right index, the wrong item.
-    let list = reset(session, user).await?;
-    let p_start = list.index_of(&start_uri(P, "probe a")).unwrap();
-    let mut replacement = UriReplacement::new();
-    replacement.set_index(p_start as i32);
-    replacement.item = Some(item(&start_uri(Q, "probe b"))).into();
-    replacement.set_new_uri(start_uri(P, "renamed by neither"));
-    let mut update = UpdateItemUris::new();
-    update.uri_replacements.push(replacement);
-    let mut o = op(Kind::UPDATE_ITEM_URIS);
-    o.update_item_uris = Some(update).into();
-    let outcome = post(session, user, &list.revision, vec![o]).await;
-    let after = read(session).await?;
-    println!(
-        "  b's item at a's index: {outcome}; a renamed {}",
-        after
-            .index_of(&start_uri(P, "renamed by neither"))
-            .is_some(),
-    );
-
-    println!("\n### can one marker be removed on its own?");
-    let list = reset(session, user).await?;
-    let p_start = list.index_of(&start_uri(P, "probe a")).unwrap();
-    let outcome = post(
-        session,
-        user,
-        &list.revision,
-        vec![rem(p_start, &[start_uri(P, "probe a")])],
-    )
-    .await;
-    println!("  REM of the start marker alone: {outcome}");
-
-    println!("\n### how Mov.to_index is counted");
-    for offset in [0i32, 1, -1] {
-        let list = reset(session, user).await?;
-        let from = list.index_of(&start_uri(P, "probe a")).unwrap();
-        let q_end = list.index_of(&end_uri(Q)).unwrap();
-        let to = (q_end as i32 + offset) as usize;
-        let outcome = post(session, user, &list.revision, vec![mov(from, 2, to)]).await;
-        let after = read(session).await?;
+        .await?;
+        let after = read(ctx).await?;
+        let stored = after
+            .uris
+            .iter()
+            .find(|uri| {
+                uri.starts_with("spotify:start-group:")
+                    && marker_id(uri).is_some_and(|id| {
+                        id.eq_ignore_ascii_case(candidate)
+                            || u64::from_str_radix(id, 16).ok()
+                                == u64::from_str_radix(candidate, 16).ok()
+                    })
+            })
+            .cloned();
         println!(
-            "  move a (at {from}, length 2) to_index {to}: {outcome}; {}",
-            after.tail()
+            "  {candidate:<18} {}; stored as {:?}",
+            sent.verdict(),
+            stored.as_deref().and_then(marker_id)
         );
     }
 
-    println!("\n### base_revision");
-    let list = reset(session, user).await?;
-    let p_start = list.index_of(&start_uri(P, "probe a")).unwrap();
-    let garbage = vec![0u8; list.revision.len()];
+    println!("\n### a 16-digit id whose first digit is zero");
+    let list = arrange(ctx, &[Slot::Folder(S1, "sacrifice")]).await?;
+    let sent = post(
+        ctx,
+        Some(&list.revision),
+        vec![add_at(0, &folder(Z, "zero"))],
+    )
+    .await?;
+    let after = read(ctx).await?;
+    let stored = after
+        .find_marker(Z, true)
+        .map(|index| after.uris[index].clone());
     println!(
-        "  a revision the server never issued: {}",
-        post(
-            session,
-            user,
-            &garbage,
-            vec![rem(p_start, &folder(P, "probe a"))]
+        "  wrote {:?}: {}; read back {:?}, exact string survives {}",
+        start_uri(Z, "zero"),
+        sent.verdict(),
+        stored,
+        stored.as_deref() == Some(start_uri(Z, "zero").as_str())
+    );
+    if let Some(stored) = stored {
+        // Renaming through the URI the server returned is what production
+        // would do, so prove that round trip too.
+        let list = read(ctx).await?;
+        let index = list.index_of(&stored).unwrap();
+        let sent = post(
+            ctx,
+            Some(&list.revision),
+            vec![update(
+                Some(index),
+                Some(&stored),
+                &start_uri(Z, "zero renamed"),
+            )],
         )
-        .await
-    );
-
-    let list = reset(session, user).await?;
-    let stale = list.revision.clone();
-    let p_start = list.index_of(&start_uri(P, "probe a")).unwrap();
-    let q_start = list.index_of(&start_uri(Q, "probe b")).unwrap();
-    println!(
-        "  before {}   (a at {p_start}, b at {q_start})",
-        list.tail()
-    );
-    // Swap the two folders, so the index a had at the stale revision now holds b.
-    post(
-        session,
-        user,
-        &list.revision,
-        vec![mov(q_start, 2, p_start)],
-    )
-    .await;
-    let swapped = read(session).await?;
-    println!(
-        "  after a change from elsewhere {}   (a at {:?}, b at {:?})",
-        swapped.tail(),
-        swapped.index_of(&start_uri(P, "probe a")),
-        swapped.index_of(&start_uri(Q, "probe b")),
-    );
-    if !swapped.is_probe(p_start) || !swapped.is_probe(p_start + 1) {
-        println!("  (skipped: the stale index left probe territory)");
-        return Ok(());
+        .await?;
+        let after = read(ctx).await?;
+        println!(
+            "  renaming it through the returned URI: {}; renamed {}",
+            sent.verdict(),
+            after
+                .find_marker(Z, true)
+                .map(|index| after.uris[index].contains("renamed"))
+                .unwrap_or(false)
+        );
     }
-    let outcome = post(
-        session,
-        user,
-        &stale,
-        vec![rem(p_start, &folder(P, "probe a"))],
-    )
-    .await;
-    let after = read(session).await?;
-    let a_gone = after.index_of(&start_uri(P, "probe a")).is_none();
+
+    println!("\n### how long a folder name may be");
+    for length in [100usize, 200, 300, 500, 1000] {
+        let list = arrange(ctx, &[Slot::Folder(S1, "sacrifice")]).await?;
+        let name = "n".repeat(length);
+        let sent = post(
+            ctx,
+            Some(&list.revision),
+            vec![add_at(0, &folder(P, &name))],
+        )
+        .await?;
+        let after = read(ctx).await?;
+        let stored = after
+            .find_marker(P, true)
+            .and_then(|index| after.uris[index].split(':').nth(3).map(str::to_string));
+        println!(
+            "  {length:>4} characters: {}; stored {} characters",
+            sent.verdict(),
+            stored.map_or("none".to_string(), |name| decode_name(&name)
+                .chars()
+                .count()
+                .to_string())
+        );
+    }
+
+    println!("\n### unicode, spaces and punctuation in a folder name");
+    let name = "probe ünïcode +plus %pct : colon";
+    let list = arrange(ctx, &[Slot::Folder(S1, "sacrifice")]).await?;
+    let sent = post(ctx, Some(&list.revision), vec![add_at(0, &folder(P, name))]).await?;
+    let after = read(ctx).await?;
+    let stored = after
+        .find_marker(P, true)
+        .map(|index| after.uris[index].clone());
     println!(
-        "  replaying a delta built at the older revision: {outcome}; a present {}, b present {}",
-        !a_gone,
-        after.index_of(&start_uri(Q, "probe b")).is_some(),
+        "  {}; round trip {:?}",
+        sent.verdict(),
+        stored
+            .as_deref()
+            .and_then(|uri| uri.splitn(4, ':').nth(3))
+            .map(decode_name)
     );
+    Ok(())
+}
+
+async fn playlist_semantics(ctx: &Ctx) -> Result<()> {
+    println!("\n### what removing a playlist from the rootlist does to the library");
+    // A folder holding one disposable playlist, removed as one span, which is
+    // what "delete folder and its contents" would send.
+    let list = arrange(
+        ctx,
+        &[
+            Slot::Folder(S1, "sacrifice"),
+            Slot::Open(P, "with contents"),
+            Slot::Playlist(1),
+            Slot::Close,
+        ],
+    )
+    .await?;
+    let start = list.find_marker(P, true).unwrap();
+    let span = &list.uris[start..start + 3];
+    if span[1] != ctx.playlists[1] || !span[2].starts_with("spotify:end-group:") {
+        bail!("the folder did not come out holding exactly the disposable playlist: {span:?}");
+    }
+    let id = ctx.playlist_id(1).to_string();
+    println!("  before: followed {}", follows(ctx, &id).await?);
+    let sent = post(ctx, Some(&list.revision), vec![rem_at(start, 3)]).await?;
+    let after = read(ctx).await?;
     println!(
-        "  -> the server {}",
-        if a_gone {
-            "REBASED the stale delta onto the change it had not seen"
-        } else {
-            "applied the stale index LITERALLY and hit the wrong folder"
-        }
+        "  removing the span: {}; still in the rootlist {}, still followed {}",
+        sent.verdict(),
+        after.index_of(&ctx.playlists[1]).is_some(),
+        follows(ctx, &id).await?
     );
 
-    let list = reset(session, user).await?;
-    let stale = list.revision.clone();
-    let p_old = list.index_of(&start_uri(P, "probe a")).unwrap();
-    let q_old = list.index_of(&start_uri(Q, "probe b")).unwrap();
-    post(session, user, &list.revision, vec![mov(q_old, 2, p_old)]).await;
-    let swapped = read(session).await?;
-    let p_fresh = swapped.index_of(&start_uri(P, "probe a")).unwrap();
-    let outcome = post(
-        session,
-        user,
-        &stale,
-        vec![rem(p_fresh, &folder(P, "probe a"))],
+    println!("\n### does a Web API unfollow reach the rootlist on its own?");
+    let id = ctx.playlist_id(0).to_string();
+    unfollow(ctx, &id).await?;
+    let after = read(ctx).await?;
+    println!(
+        "  unfollowed X1; still in the rootlist {}, followed {}",
+        after.index_of(&ctx.playlists[0]).is_some(),
+        follows(ctx, &id).await?
+    );
+    Ok(())
+}
+
+/// The rest of the anchors, one per gesture the sidebar has to express: drop
+/// before a sibling, drop at the end of the root, drop at the top, and drop a
+/// whole folder. Every form here names its destination by item, so none of
+/// them carries an index or a revision.
+async fn move_anchors(ctx: &Ctx) -> Result<()> {
+    println!("\n### MOV: the remaining destinations, all by item");
+
+    let list = arrange(
+        ctx,
+        &[
+            Slot::Playlist(0),
+            Slot::Folder(Q, "sibling"),
+            Slot::Playlist(1),
+        ],
     )
-    .await;
-    let after = read(session).await?;
+    .await?;
+    let q_start = list.find_marker(Q, true).unwrap();
+    let mut mov = Mov::new();
+    mov.items = items_of(&[ctx.playlists[1].clone()]);
+    mov.add_before_item = Some(item(&list.uris[q_start])).into();
+    let sent = post(ctx, None, vec![wrap_mov(mov)]).await?;
+    let after = read(ctx).await?;
     println!(
-        "  fresh index {p_fresh} with the older revision: {outcome}; a present {}, b present {}",
-        after.index_of(&start_uri(P, "probe a")).is_some(),
-        after.index_of(&start_uri(Q, "probe b")).is_some(),
+        "  add_before_item, a folder's start marker: {}; X2 at {:?}, Q at {:?}, head {}",
+        sent.verdict(),
+        after.index_of(&ctx.playlists[1]),
+        after.find_marker(Q, true),
+        after.head(6, &ctx.playlists)
     );
+
+    let list = arrange(ctx, &[Slot::Playlist(0), Slot::Playlist(1)]).await?;
+    let mut mov = Mov::new();
+    mov.items = items_of(&[ctx.playlists[1].clone()]);
+    mov.set_add_last(true);
+    let sent = post(ctx, None, vec![wrap_mov(mov)]).await?;
+    let after = read(ctx).await?;
     println!(
-        "  -> the server rebased the index from the claimed snapshot, so mixing snapshots hit {}",
-        if after.index_of(&start_uri(Q, "probe b")).is_none() {
-            "the wrong folder"
-        } else {
-            "an unexpected target"
-        }
+        "  add_last: {}; X2 at {:?} of {} items",
+        sent.verdict(),
+        after.index_of(&ctx.playlists[1]),
+        after.uris.len()
     );
+    let _ = list;
+
+    let list = arrange(ctx, &[Slot::Playlist(0), Slot::Playlist(1)]).await?;
+    let mut mov = Mov::new();
+    mov.items = items_of(&[ctx.playlists[1].clone()]);
+    mov.set_add_first(true);
+    let sent = post(ctx, None, vec![wrap_mov(mov)]).await?;
+    let after = read(ctx).await?;
+    println!(
+        "  add_first: {}; X2 at {:?}",
+        sent.verdict(),
+        after.index_of(&ctx.playlists[1])
+    );
+    let _ = list;
+
+    let list = arrange(
+        ctx,
+        &[
+            Slot::Open(P, "moved"),
+            Slot::Playlist(1),
+            Slot::Close,
+            Slot::Playlist(0),
+        ],
+    )
+    .await?;
+    let p_start = list.find_marker(P, true).unwrap();
+    let p_end = list.find_marker(P, false).unwrap();
+    let mut mov = Mov::new();
+    mov.items = items_of(&[
+        list.uris[p_start].clone(),
+        list.uris[p_start + 1].clone(),
+        list.uris[p_end].clone(),
+    ]);
+    mov.set_add_last(true);
+    let sent = post(ctx, None, vec![wrap_mov(mov)]).await?;
+    let after = read(ctx).await?;
+    println!(
+        "  a folder with a child, whole span, add_last: {}; P at {:?} of {} items, child follows {}",
+        sent.verdict(),
+        after.find_marker(P, true),
+        after.uris.len(),
+        after.find_marker(P, true).map(|start| start + 1) == after.index_of(&ctx.playlists[1])
+    );
+
+    println!("\n### REM: dropping a folder's markers while its contents stay");
+    let list = arrange(
+        ctx,
+        &[
+            Slot::Open(P, "emptied"),
+            Slot::Playlist(1),
+            Slot::Close,
+            Slot::Playlist(0),
+        ],
+    )
+    .await?;
+    let p_start = list.find_marker(P, true).unwrap();
+    let p_end = list.find_marker(P, false).unwrap();
+    let mut rem = Rem::new();
+    rem.set_items_as_key(true);
+    rem.items = items_of(&[list.uris[p_start].clone(), list.uris[p_end].clone()]);
+    let sent = post(ctx, None, vec![wrap_rem(rem)]).await?;
+    let after = read(ctx).await?;
+    println!(
+        "  both markers in one op, contents between them: {}; P gone {}, X2 still there {}, head {}",
+        sent.verdict(),
+        !after.has_folder(P),
+        after.index_of(&ctx.playlists[1]).is_some(),
+        after.head(6, &ctx.playlists)
+    );
+
+    let list = arrange(
+        ctx,
+        &[
+            Slot::Open(P, "destination"),
+            Slot::Playlist(0),
+            Slot::Close,
+            Slot::Playlist(1),
+        ],
+    )
+    .await?;
+    let p_end = list.find_marker(P, false).unwrap();
+    let mut mov = Mov::new();
+    mov.items = items_of(&[ctx.playlists[1].clone()]);
+    mov.add_before_item = Some(item(&list.uris[p_end])).into();
+    let sent = post(ctx, None, vec![wrap_mov(mov)]).await?;
+    let after = read(ctx).await?;
+    println!(
+        "  add_before_item, a folder's end marker: {}; X2 last inside P {}, head {}",
+        sent.verdict(),
+        after.find_marker(P, false).map(|end| end - 1) == after.index_of(&ctx.playlists[1]),
+        after.head(6, &ctx.playlists)
+    );
+
+    println!("\n### REM: a whole folder span by items, the destructive delete");
+    let list = arrange(
+        ctx,
+        &[
+            Slot::Open(P, "with contents"),
+            Slot::Playlist(1),
+            Slot::Close,
+            Slot::Playlist(0),
+        ],
+    )
+    .await?;
+    let p_start = list.find_marker(P, true).unwrap();
+    let p_end = list.find_marker(P, false).unwrap();
+    let span: Vec<String> = list.uris[p_start..=p_end].to_vec();
+    let id = ctx.playlist_id(1).to_string();
+    let mut rem = Rem::new();
+    rem.set_items_as_key(true);
+    rem.items = items_of(&span);
+    let sent = post(ctx, None, vec![wrap_rem(rem)]).await?;
+    let after = read(ctx).await?;
+    println!(
+        "  the whole span in one op: {}; P gone {}, X2 in the rootlist {}, X2 in the library {}",
+        sent.verdict(),
+        !after.has_folder(P),
+        after.index_of(&ctx.playlists[1]).is_some(),
+        follows(ctx, &id).await?
+    );
+
+    println!("\n### naming an item that is no longer there");
+    let list = arrange(ctx, &[Slot::Folder(P, "vanishing")]).await?;
+    let p_start = list.find_marker(P, true).unwrap();
+    let stale = list.uris[p_start].clone();
+    let stale_end = list.uris[p_start + 1].clone();
+    let mut rem = Rem::new();
+    rem.set_items_as_key(true);
+    rem.items = items_of(&[stale.clone(), stale_end.clone()]);
+    let sent = post(ctx, None, vec![wrap_rem(rem)]).await?;
+    if !sent.ok() {
+        bail!("could not remove the folder first: {}", sent.verdict());
+    }
+    let mut rem = Rem::new();
+    rem.set_items_as_key(true);
+    rem.items = items_of(&[stale, stale_end]);
+    let sent = post(ctx, None, vec![wrap_rem(rem)]).await?;
+    println!("  removing it a second time: {}", sent.verdict());
+
+    let list = read(ctx).await?;
+    let mut mov = Mov::new();
+    mov.items = items_of(&[start_uri(Q, "never existed"), end_uri(Q)]);
+    mov.set_add_last(true);
+    let sent = post(ctx, None, vec![wrap_mov(mov)]).await?;
+    println!("  moving a folder that never existed: {}", sent.verdict());
+    let _ = list;
     Ok(())
 }

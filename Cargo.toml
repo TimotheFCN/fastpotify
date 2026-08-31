@@ -178,5 +178,8 @@ librespot-protocol = { git = "https://github.com/crmne/librespot", branch = "fas
 
 [dev-dependencies]
 # `examples/rootlist_probe.rs` speaks the private playlist protocol directly.
-# `http` is already in the lock file as a transitive dependency.
-http = "1"
+# It sends one request body as the JSON Spotify's own web client uses, to check
+# that the encoding makes no difference; the crate is already in the lock file
+# as a librespot dependency, but Cargo will not let an example import it
+# undeclared.
+protobuf-json-mapping = "3"
