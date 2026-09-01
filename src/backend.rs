@@ -441,8 +441,18 @@ pub enum Command {
     CheckForUpdates,
     /// The words of a track, from LRCLIB.
     Lyrics(Box<LyricsRequest>),
-    /// The account's playlist tree, folders and all, from the session.
-    Rootlist,
+    /// Read or change the account's playlist tree through the session.
+    Rootlist(RootlistRequest),
+    /// Forget the on-disk rootlist cache (folders became unreachable).
+    DropRootlistCache {
+        account_id: String,
+    },
+    /// Internal: one serialized rootlist job ended.
+    RootlistFinished {
+        account_id: String,
+        result: RootlistResult,
+        readback: bool,
+    },
     /// Check that a reconnect's pickup really started, and try again if not.
     VerifyResume,
     /// Add, replace, or remove the optional personal Web API application.
@@ -465,6 +475,21 @@ pub struct LyricsRequest {
     /// The track the answer is for, so a stale one is ignored.
     pub uri: String,
     pub query: crate::lyrics::Query,
+}
+
+pub enum RootlistRequest {
+    Refresh {
+        account_id: String,
+    },
+    Mutate {
+        account_id: String,
+        mutation: crate::rootlist::Mutation,
+    },
+}
+
+pub enum RootlistResult {
+    Refreshed(Result<crate::rootlist::Snapshot, String>),
+    Mutated(crate::rootlist::MutationOutcome),
 }
 
 pub enum Event {
@@ -495,7 +520,14 @@ pub enum Event {
     },
     /// The account's playlist tree, folders and all.
     Rootlist {
-        result: Result<Vec<crate::player::RootlistEntry>, String>,
+        account_id: String,
+        result: RootlistResult,
+        refreshing: bool,
+    },
+    /// The last complete rootlist read for this account, for display only.
+    RootlistCache {
+        account_id: String,
+        snapshot: crate::rootlist::Snapshot,
     },
     /// A playlist's items as last cached, with the snapshot they belong to.
     PlaylistCache {
@@ -694,6 +726,36 @@ struct Worker {
     resume: Option<LoadSpec>,
     /// A pickup in flight: the load to repeat and how often it was tried.
     resume_verify: Option<(LoadSpec, u8)>,
+    rootlist_lane: RootlistLane,
+}
+
+#[derive(Default)]
+struct RootlistLane {
+    busy: bool,
+    pending_refresh: bool,
+}
+
+impl RootlistLane {
+    fn begin(&mut self, refresh: bool) -> bool {
+        if self.busy {
+            self.pending_refresh |= refresh;
+            false
+        } else {
+            self.busy = true;
+            true
+        }
+    }
+
+    fn finish(&mut self, readback: bool) -> bool {
+        self.busy = false;
+        if readback {
+            self.pending_refresh = false;
+            return false;
+        }
+        let pending = self.pending_refresh;
+        self.pending_refresh = false;
+        pending
+    }
 }
 
 impl Worker {
@@ -730,6 +792,7 @@ impl Worker {
             reconnects: Vec::new(),
             resume: None,
             resume_verify: None,
+            rootlist_lane: RootlistLane::default(),
         }
     }
 
@@ -816,7 +879,13 @@ impl Worker {
                 Command::ActivateReceiver(receiver) => self.activate_receiver(*receiver),
                 Command::CheckForUpdates => self.check_for_updates(),
                 Command::Lyrics(request) => self.fetch_lyrics(*request),
-                Command::Rootlist => self.fetch_rootlist(),
+                Command::Rootlist(request) => self.rootlist(request),
+                Command::DropRootlistCache { account_id } => self.drop_rootlist_cache(&account_id),
+                Command::RootlistFinished {
+                    account_id,
+                    result,
+                    readback,
+                } => self.finish_rootlist(account_id, result, readback),
                 Command::VerifyResume => self.verify_resume(),
                 Command::LoadPlaylistCache { id } => self.load_playlist_cache(id),
                 Command::StorePlaylistCache {
@@ -959,6 +1028,7 @@ impl Worker {
                     username: user.name().to_string(),
                 }));
                 self.emit(Event::Api(Box::new(ApiResponse::Me(Ok(user.clone())))));
+                self.load_rootlist_cache(user.id.clone());
                 let premium = user.product.as_deref().map(|product| product == "premium");
                 self.on_account_checked(premium);
             }
@@ -1090,6 +1160,9 @@ impl Worker {
         }
         self.authorizing_source = None;
         self.pending_authorization = None;
+        if let Some(account) = self.api.account() {
+            let _ = std::fs::remove_file(self.dirs.account_rootlist_cache_file(account.as_str()));
+        }
         self.api.clear_all();
         crate::auth::StoredToken::remove(&self.dirs.shared_web_token_file());
         crate::auth::StoredToken::remove(&self.dirs.personal_web_token_file());
@@ -1444,20 +1517,102 @@ impl Worker {
         });
     }
 
-    fn fetch_rootlist(&self) {
-        let Some(engine) = self.engine.clone() else {
+    fn rootlist(&mut self, request: RootlistRequest) {
+        let account_id = match &request {
+            RootlistRequest::Refresh { account_id }
+            | RootlistRequest::Mutate { account_id, .. } => account_id.clone(),
+        };
+        let Some(engine) = self
+            .engine
+            .clone()
+            .filter(|engine| engine.username() == account_id)
+        else {
+            let result = match request {
+                RootlistRequest::Refresh { .. } => RootlistResult::Refreshed(Err(
+                    "Playlist folders need a matching playback session".into(),
+                )),
+                RootlistRequest::Mutate { .. } => {
+                    RootlistResult::Mutated(crate::rootlist::MutationOutcome::NotSent(
+                        "Playlist folders need a matching playback session".into(),
+                    ))
+                }
+            };
+            self.emit(Event::Rootlist {
+                account_id,
+                result,
+                refreshing: false,
+            });
             return;
         };
-        let events = self.events.clone();
-        let waker = self.waker.clone();
-        tokio::spawn(async move {
-            let result = engine
-                .rootlist()
-                .await
-                .map_err(|error| format!("{error:#}"));
-            let _ = events.send(Event::Rootlist { result });
-            waker.wake();
+
+        match request {
+            RootlistRequest::Refresh { .. } => {
+                if !self.rootlist_lane.begin(true) {
+                    return;
+                }
+                let commands = self.commands.clone();
+                tokio::spawn(async move {
+                    let result = engine
+                        .rootlist()
+                        .await
+                        .map_err(|error| format!("{error:#}"));
+                    let _ = commands.send(Command::RootlistFinished {
+                        account_id,
+                        result: RootlistResult::Refreshed(result),
+                        readback: false,
+                    });
+                });
+            }
+            RootlistRequest::Mutate { mutation, .. } => {
+                if !self.rootlist_lane.begin(false) {
+                    self.emit(Event::Rootlist {
+                        account_id,
+                        result: RootlistResult::Mutated(crate::rootlist::MutationOutcome::NotSent(
+                            "Playlist folders are busy".into(),
+                        )),
+                        refreshing: false,
+                    });
+                    return;
+                }
+                let commands = self.commands.clone();
+                let http = self.http.clone();
+                tokio::spawn(async move {
+                    let (outcome, readback) =
+                        run_rootlist_mutation(&engine, &http, &account_id, &mutation).await;
+                    let _ = commands.send(Command::RootlistFinished {
+                        account_id,
+                        result: RootlistResult::Mutated(outcome),
+                        readback,
+                    });
+                });
+            }
+        }
+    }
+
+    fn finish_rootlist(&mut self, account_id: String, result: RootlistResult, readback: bool) {
+        let refresh = self.rootlist_lane.finish(readback);
+        match &result {
+            RootlistResult::Refreshed(Ok(snapshot))
+            | RootlistResult::Mutated(crate::rootlist::MutationOutcome::Confirmed(snapshot)) => {
+                self.store_rootlist_cache(&account_id, snapshot);
+            }
+            RootlistResult::Mutated(crate::rootlist::MutationOutcome::Unknown {
+                last_snapshot: Some(snapshot),
+                ..
+            }) => self.store_rootlist_cache(&account_id, snapshot),
+            // An unreachable rootlist must not linger on disk, or the next
+            // start would show folders that cannot be interacted with.
+            RootlistResult::Refreshed(Err(_)) => self.drop_rootlist_cache(&account_id),
+            _ => {}
+        }
+        self.emit(Event::Rootlist {
+            account_id: account_id.clone(),
+            result,
+            refreshing: refresh,
         });
+        if refresh {
+            self.rootlist(RootlistRequest::Refresh { account_id });
+        }
     }
 
     fn fetch_lyrics(&self, request: LyricsRequest) {
@@ -1512,6 +1667,53 @@ impl Worker {
                 items: cached.items,
             });
             waker.wake();
+        });
+    }
+
+    fn load_rootlist_cache(&self, account_id: String) {
+        let events = self.events.clone();
+        let waker = self.waker.clone();
+        let path = self.dirs.account_rootlist_cache_file(&account_id);
+        tokio::spawn(async move {
+            let Ok(text) = tokio::fs::read_to_string(path).await else {
+                return;
+            };
+            let Ok(cached) = serde_json::from_str::<CachedRootlist>(&text) else {
+                return;
+            };
+            let Ok(snapshot) = crate::rootlist::Snapshot::parse(&cached.uris) else {
+                return;
+            };
+            let _ = events.send(Event::RootlistCache {
+                account_id,
+                snapshot,
+            });
+            waker.wake();
+        });
+    }
+
+    fn drop_rootlist_cache(&self, account_id: &str) {
+        let path = self.dirs.account_rootlist_cache_file(account_id);
+        tokio::spawn(async move {
+            let _ = tokio::fs::remove_file(path).await;
+        });
+    }
+
+    fn store_rootlist_cache(&self, account_id: &str, snapshot: &crate::rootlist::Snapshot) {
+        let path = self.dirs.account_rootlist_cache_file(account_id);
+        let cached = CachedRootlist {
+            uris: snapshot.uris().map(str::to_string).collect(),
+        };
+        tokio::spawn(async move {
+            if let Some(parent) = path.parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            if let Ok(text) = serde_json::to_string(&cached) {
+                let temporary = path.with_extension("json.tmp");
+                if tokio::fs::write(&temporary, text).await.is_ok() {
+                    let _ = tokio::fs::rename(temporary, path).await;
+                }
+            }
         });
     }
 
@@ -2044,9 +2246,101 @@ async fn spotify_lyrics(
     }
 }
 
+async fn run_rootlist_mutation(
+    engine: &Engine,
+    http: &reqwest::Client,
+    account_id: &str,
+    mutation: &crate::rootlist::Mutation,
+) -> (crate::rootlist::MutationOutcome, bool) {
+    use crate::rootlist::{MutationOutcome, SendOutcome};
+
+    let send_note = match engine.change_rootlist(http, account_id, mutation).await {
+        SendOutcome::Accepted => None,
+        SendOutcome::NotSent(error) => return (MutationOutcome::NotSent(error), false),
+        SendOutcome::Rejected(error) => return (MutationOutcome::Rejected(error), false),
+        SendOutcome::Uncertain(error) => Some(error),
+    };
+    let mut last_snapshot = None;
+    let mut last_error = None;
+    for attempt in 0..=crate::model::STALE_ANSWER_RETRIES {
+        match engine.rootlist().await {
+            Ok(snapshot) if mutation.is_confirmed_by(&snapshot) => {
+                return (MutationOutcome::Confirmed(snapshot), true);
+            }
+            Ok(snapshot) => last_snapshot = Some(snapshot),
+            Err(error) => last_error = Some(format!("{error:#}")),
+        }
+        if attempt < crate::model::STALE_ANSWER_RETRIES {
+            tokio::time::sleep(crate::model::STALE_ANSWER_RECHECK).await;
+        }
+    }
+    let detail = last_error
+        .or(send_note)
+        .unwrap_or_else(|| "Spotify kept returning the previous folder order".into());
+    // A readback that never produced a snapshot did not refresh anything, so
+    // it must not swallow a refresh queued behind the mutation.
+    let refreshed = last_snapshot.is_some();
+    (
+        MutationOutcome::Unknown {
+            last_snapshot,
+            error: format!("Spotify did not confirm the folder change: {detail}"),
+        },
+        refreshed,
+    )
+}
+
 /// A playlist's items on disk, valid for exactly one snapshot.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedPlaylist {
     snapshot: String,
     items: Vec<PlaylistItem>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CachedRootlist {
+    uris: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CachedRootlist, RootlistLane};
+
+    #[test]
+    fn rootlist_lane_coalesces_refreshes_and_never_queues_mutations() {
+        let mut lane = RootlistLane::default();
+        assert!(lane.begin(true));
+        assert!(!lane.begin(true));
+        assert!(!lane.begin(true));
+        assert!(!lane.begin(false));
+        assert!(lane.finish(false));
+        assert!(lane.begin(true));
+        assert!(!lane.finish(false));
+    }
+
+    #[test]
+    fn rootlist_cache_round_trips_through_the_strict_parser() {
+        let original = crate::rootlist::Snapshot::parse(&[
+            "spotify:start-group:1:Folder".into(),
+            "spotify:playlist:a".into(),
+            "spotify:end-group:1".into(),
+        ])
+        .unwrap();
+        let encoded = serde_json::to_string(&CachedRootlist {
+            uris: original.uris().map(str::to_string).collect(),
+        })
+        .unwrap();
+        let cached = serde_json::from_str::<CachedRootlist>(&encoded).unwrap();
+        let restored = crate::rootlist::Snapshot::parse(&cached.uris).unwrap();
+
+        assert_eq!(restored, original);
+    }
+
+    #[test]
+    fn mutation_readback_satisfies_a_pending_refresh() {
+        let mut lane = RootlistLane::default();
+        assert!(lane.begin(false));
+        assert!(!lane.begin(true));
+        assert!(!lane.finish(true));
+        assert!(lane.begin(true));
+    }
 }

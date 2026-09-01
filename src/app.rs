@@ -11,7 +11,7 @@ use crate::api::models::{
 };
 use crate::backend::{
     ApiRequest, ApiResponse, AuthStatus, Backend, Command, Event, LocalPlayback, LyricsRequest,
-    PLAYLIST_PAGE_SIZE, RemoteAction, Waker,
+    PLAYLIST_PAGE_SIZE, RemoteAction, RootlistRequest, RootlistResult, Waker,
 };
 use crate::media::{MediaCommand, MediaState, MediaTrack};
 use crate::media_controls::MediaService;
@@ -34,6 +34,7 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(280);
 const RESTART_BEFORE_PREVIOUS: u32 = 3_000;
 
 const TOAST_LIFETIME: Duration = Duration::from_millis(3200);
+const CREATED_AT_ROOT: &str = "Spotify created the playlist at the root.";
 const OPTIMISTIC_HOLD: Duration = Duration::from_millis(2500);
 
 /// How long a context the app just started is shown as playing while
@@ -48,12 +49,6 @@ const PLAYBACK_HOLD: Duration = Duration::from_secs(6);
 /// A second look after a command, so the button settles quickly rather than
 /// waiting for the ordinary poll.
 const REMOTE_RECHECK: Duration = Duration::from_millis(1200);
-/// A second look at the queue after a change made here, because Spotify's
-/// queue endpoint can answer with a snapshot from before the change.
-const QUEUE_RECHECK: Duration = Duration::from_millis(700);
-/// How many stale queue answers are asked again before Spotify's version
-/// of events wins anyway.
-const QUEUE_STALE_RETRIES: u8 = 6;
 /// Within this window a second Play next of the same song is the same
 /// click; beyond it, it is a second wish and queues a second row.
 const QUEUE_ADD_DEBOUNCE: Duration = Duration::from_millis(1500);
@@ -143,6 +138,7 @@ pub struct App {
     /// The window should close and reopen at once as the other kind: the
     /// big window or the Winamp mini player.
     pub switch_intent: bool,
+    window_focused: bool,
     /// Commands from control clients (a second `fastpotify <verb>` launch,
     /// a Raycast script), on the platforms where they do not arrive through
     /// MPRIS. Drained every frame.
@@ -176,7 +172,7 @@ pub struct App {
     remote_poll_seq: u64,
     /// The restorable session (sorts, recents, resume point) changed and
     /// should be written shortly, not only at exit.
-    pub session_dirty: bool,
+    session_dirty: bool,
     last_session_save: Instant,
     /// The saved zoom has been applied to the context once.
     zoom_applied: bool,
@@ -306,6 +302,7 @@ pub struct App {
     assumed_context: Option<AssumedContext>,
     last_now_playing_uri: Option<String>,
     pub playlist_busy: bool,
+    pending_playlist_creation: Option<PlaylistCreation>,
     pub quit_requested: bool,
     /// The axis a scroll gesture settled on, and when it last moved.
     scroll_lock: Option<(ScrollAxis, Instant)>,
@@ -340,11 +337,11 @@ pub struct App {
     /// Adds shown in the queue before Spotify confirms them: the uri and
     /// when it was asked, so a slow answer cannot erase or double them.
     pending_queue_adds: Vec<(String, Instant)>,
-    /// The account's playlist tree from Spotify, folders and all; empty
-    /// until the session answers.
-    pub rootlist: Vec<crate::player::RootlistEntry>,
-    /// Sidebar folders rolled up, by their rootlist ids.
-    pub collapsed_folders: Vec<String>,
+    pub folders: crate::rootlist::FolderState,
+    /// Sidebar folders the listener has opened. Absence means collapsed.
+    pub expanded_folders: HashSet<crate::rootlist::FolderId>,
+    folder_state_account: Option<String>,
+    legacy_collapsed_folders: Option<HashSet<crate::rootlist::FolderId>>,
     /// A newer release than this build, once GitHub has said so.
     pub update: Option<crate::updates::Release>,
     last_update_check: Option<Instant>,
@@ -352,10 +349,23 @@ pub struct App {
     pub winamp: crate::winamp::WinampState,
 }
 
+#[derive(Default)]
+struct PlaylistCreation {
+    add_uris: Vec<String>,
+    destination: Option<crate::rootlist::FolderId>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ScrollAxis {
     Horizontal,
     Vertical,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FolderAccess<'a> {
+    Starting,
+    Unavailable,
+    Ready(&'a str),
 }
 
 /// A trackpad gesture that pauses this long has ended; the next movement
@@ -401,7 +411,9 @@ impl App {
             .then(|| TrayService::spawn(move || wake.wake()))
             .flatten();
 
-        let session = SessionState::load(&dirs.session_file());
+        let session_file = dirs.session_file();
+        let had_session = session_file.is_file();
+        let session = SessionState::load(&session_file);
         let first_page = session
             .last_page
             .as_deref()
@@ -421,6 +433,7 @@ impl App {
             hide_intent: false,
             wants_show: false,
             switch_intent: false,
+            window_focused: false,
             control_commands: None,
             control_now_playing: None,
             control_devices: None,
@@ -522,6 +535,7 @@ impl App {
             assumed_context: None,
             last_now_playing_uri: None,
             playlist_busy: false,
+            pending_playlist_creation: None,
             quit_requested: false,
             scroll_lock: None,
             scroll_from_trackpad: false,
@@ -543,8 +557,24 @@ impl App {
             resume_queue: session.last_added_queue.clone(),
             manual_queue: Vec::new(),
             pending_queue_adds: Vec::new(),
-            rootlist: Vec::new(),
-            collapsed_folders: session.collapsed_folders.clone(),
+            folders: crate::rootlist::FolderState::default(),
+            expanded_folders: session
+                .expanded_folders
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|id| id.parse().ok())
+                .collect(),
+            folder_state_account: session.folder_account_id.clone(),
+            legacy_collapsed_folders: (had_session && session.expanded_folders.is_none()).then(
+                || {
+                    session
+                        .collapsed_folders
+                        .iter()
+                        .filter_map(|id| id.parse().ok())
+                        .collect()
+                },
+            ),
             update: None,
             last_update_check: None,
             winamp: crate::winamp::WinampState::new(session.winamp_pos, tap, eq),
@@ -1024,10 +1054,56 @@ impl App {
                     self.accents.insert(url, tint);
                 }
                 Event::Error(message) => self.toast_error(message),
-                Event::Rootlist { result } => match result {
-                    Ok(entries) => self.rootlist = entries,
-                    Err(error) => log::warn!("rootlist unavailable: {error}"),
-                },
+                Event::Rootlist {
+                    account_id,
+                    result,
+                    refreshing,
+                } => {
+                    if self.user_id() != Some(account_id.as_str()) {
+                        continue;
+                    }
+                    match result {
+                        RootlistResult::Refreshed(result) => {
+                            if let Err(error) = &result {
+                                log::warn!("rootlist unavailable: {error}");
+                            }
+                            self.folders.finish_refresh(account_id.clone(), result);
+                        }
+                        RootlistResult::Mutated(outcome) => {
+                            let placed_playlist = self.folders.is_placing_created_playlist();
+                            let error = match &outcome {
+                                crate::rootlist::MutationOutcome::Confirmed(_) => None,
+                                crate::rootlist::MutationOutcome::NotSent(error)
+                                | crate::rootlist::MutationOutcome::Rejected(error)
+                                | crate::rootlist::MutationOutcome::Unknown { error, .. } => {
+                                    Some(error.clone())
+                                }
+                            };
+                            self.folders.finish_mutation(outcome);
+                            if let Some(error) = error {
+                                self.toast_error(if placed_playlist {
+                                    format!("{CREATED_AT_ROOT} {error}")
+                                } else {
+                                    error
+                                });
+                            }
+                        }
+                    }
+                    self.reconcile_folder_state(&account_id);
+                    if refreshing {
+                        self.folders.begin_refresh();
+                    }
+                }
+                Event::RootlistCache {
+                    account_id,
+                    snapshot,
+                } => {
+                    if self.user_id() == Some(account_id.as_str())
+                        && self.folders.install_cache(snapshot)
+                    {
+                        self.reconcile_folder_state(&account_id);
+                    }
+                }
                 Event::Lyrics { uri, result } => {
                     if self.lyrics_uri.as_deref() == Some(uri.as_str()) {
                         self.lyrics = match result {
@@ -1094,6 +1170,7 @@ impl App {
             _ => {}
         }
         self.auth = status;
+        self.load_folders_when_ready();
     }
 
     fn handle_playback(&mut self, status: LocalPlayback) {
@@ -1119,9 +1196,11 @@ impl App {
             LocalPlayback::Authorizing | LocalPlayback::Connecting => {}
         }
         self.local_playback = status;
+        self.load_folders_when_ready();
     }
 
     fn reset_data(&mut self) {
+        self.folders.reset();
         self.library = Library::default();
         self.home = HomeData::default();
         self.playlist_pages.clear();
@@ -1221,6 +1300,7 @@ impl App {
         if track_changed {
             self.on_now_playing_changed();
         }
+        self.load_folders_when_ready();
         if reconnected {
             if let Some(request) = self.queued_play.take() {
                 self.play_request(request, false);
@@ -1500,6 +1580,11 @@ impl App {
 
     fn tick(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
+        let focused = ctx.input(|input| input.viewport().focused.unwrap_or(false));
+        if focused && !self.window_focused {
+            self.refresh_folders();
+        }
+        self.window_focused = focused;
         if !self.zoom_applied {
             self.zoom_applied = true;
             let zoom = self.settings.zoom.clamp(0.5, 2.5);
@@ -2051,12 +2136,134 @@ impl App {
     // ---- loading ---------------------------------------------------------------
 
     fn load_playlists(&mut self) {
-        if self.library.playlists.is_loading() {
+        if self.library.playlists_loading {
             return;
         }
-        self.library.playlists = Loadable::Loading;
+        self.library.playlists_loading = true;
+        if self.library.playlists.get().is_none() {
+            self.library.playlists = Loadable::Loading;
+        }
         self.library.playlists_next = None;
         self.backend.api(ApiRequest::MyPlaylists { offset: 0 });
+    }
+
+    fn folder_access(&self) -> FolderAccess<'_> {
+        match self.auth {
+            AuthStatus::Starting | AuthStatus::Connecting => return FolderAccess::Starting,
+            AuthStatus::Connected { .. } => {}
+            _ => return FolderAccess::Unavailable,
+        }
+        let Some(account_id) = self.user_id() else {
+            return FolderAccess::Starting;
+        };
+        match self.local_playback {
+            LocalPlayback::Authorizing | LocalPlayback::Connecting => FolderAccess::Starting,
+            LocalPlayback::Ready { .. } if !self.local.connected => FolderAccess::Starting,
+            LocalPlayback::Ready { .. } if self.local.username == account_id => {
+                FolderAccess::Ready(account_id)
+            }
+            LocalPlayback::Ready { .. } | LocalPlayback::Unavailable | LocalPlayback::Failed(_) => {
+                FolderAccess::Unavailable
+            }
+        }
+    }
+
+    pub fn folders_starting(&self) -> bool {
+        matches!(self.folder_access(), FolderAccess::Starting)
+    }
+
+    pub fn folders_writable(&self) -> bool {
+        let engine_account = match self.folder_access() {
+            FolderAccess::Ready(account_id) => Some(account_id),
+            FolderAccess::Starting | FolderAccess::Unavailable => None,
+        };
+        self.folders.writable(self.user_id(), engine_account)
+    }
+
+    pub fn folder_mode(&self) -> bool {
+        self.folders.shown_snapshot().is_some() && self.library.playlists.get().is_some()
+    }
+
+    fn reconcile_folder_state(&mut self, account_id: &str) {
+        let Some(snapshot) = self.folders.shown_snapshot() else {
+            return;
+        };
+        let folder_ids = snapshot
+            .folders()
+            .into_iter()
+            .map(|folder| folder.id)
+            .collect::<HashSet<_>>();
+        let mut changed = false;
+        if let Some(collapsed) = self.legacy_collapsed_folders.take() {
+            self.expanded_folders = folder_ids
+                .iter()
+                .filter(|id| !collapsed.contains(id))
+                .copied()
+                .collect();
+            changed = true;
+        } else if self.folder_state_account.as_deref() != Some(account_id) {
+            changed |= !self.expanded_folders.is_empty();
+            self.expanded_folders.clear();
+        }
+        let before = self.expanded_folders.len();
+        self.expanded_folders.retain(|id| folder_ids.contains(id));
+        changed |= self.expanded_folders.len() != before;
+        changed |= self.folder_state_account.as_deref() != Some(account_id);
+        self.folder_state_account = Some(account_id.to_string());
+        self.session_dirty |= changed;
+    }
+
+    fn refresh_folders(&mut self) {
+        let FolderAccess::Ready(account_id) = self.folder_access() else {
+            return;
+        };
+        let account_id = account_id.to_string();
+        if !self.folders.begin_refresh() {
+            return;
+        }
+        self.backend
+            .send(Command::Rootlist(RootlistRequest::Refresh { account_id }));
+    }
+
+    fn load_folders_when_ready(&mut self) {
+        if self.folders.needs_initial_load() {
+            self.refresh_folders();
+        }
+        // Cached folders only bridge the wait for the session; once access is
+        // known to be unavailable they would be untouchable, so they go.
+        if matches!(self.folder_access(), FolderAccess::Unavailable)
+            && self.folders.drop_cache()
+            && let Some(account_id) = self.user_id()
+        {
+            self.backend.send(Command::DropRootlistCache {
+                account_id: account_id.to_string(),
+            });
+        }
+    }
+
+    fn change_folders(&mut self, intent: crate::rootlist::Intent) -> Result<(), String> {
+        let account_id = self
+            .user_id()
+            .filter(|_| self.folders_writable())
+            .map(str::to_string)
+            .ok_or("Playlist folders are unavailable")?;
+        let Some(plan) = self
+            .folders
+            .plan(intent)
+            .map_err(|error| error.to_string())?
+        else {
+            return Ok(());
+        };
+        let mutation = self
+            .folders
+            .begin_mutation(plan)
+            .map_err(|error| error.to_string())?;
+        self.backend
+            .send(Command::Rootlist(RootlistRequest::Mutate {
+                account_id,
+                mutation,
+            }));
+        Ok(())
     }
 
     pub fn ensure_loaded(&mut self, page: Page) {
@@ -2547,7 +2754,7 @@ impl App {
         self.backend.player(PlayerCommand::ClearQueue);
         // The engine also drops queued tracks this app never saw added;
         // the fetch behind this recheck sweeps their rows away.
-        self.queue_recheck_at = Some(Instant::now() + QUEUE_RECHECK);
+        self.queue_recheck_at = Some(Instant::now() + crate::model::STALE_ANSWER_RECHECK);
         self.toast("Queue cleared");
     }
 
@@ -2594,6 +2801,7 @@ impl App {
             name,
             public: false,
             add_uris: uris,
+            destination: None,
         });
     }
 
@@ -2615,7 +2823,7 @@ impl App {
     /// Spotify's queue endpoint can lag a skip or an add by seconds, and a
     /// lagging answer must not undo what the interface already shows.
     fn queue_fetch_is_stale(&self, fetched: &Queue) -> bool {
-        if self.queue_stale_retries >= QUEUE_STALE_RETRIES {
+        if self.queue_stale_retries >= crate::model::STALE_ANSWER_RETRIES {
             return false;
         }
         // A row was just chosen or popped: the fetch has to name it as
@@ -2731,6 +2939,7 @@ impl App {
                         self.dialog = Some(Dialog::PremiumNeeded);
                     }
                     self.user = Some(user);
+                    self.load_folders_when_ready();
                     let page = self.page().clone();
                     self.ensure_loaded(page);
                     if let Some(now) = self.now_playing() {
@@ -2881,7 +3090,8 @@ impl App {
                     // optimistic queue and ask again shortly; if Spotify
                     // keeps telling the old story, it eventually wins.
                     self.queue_stale_retries += 1;
-                    self.queue_recheck_at = Some(Instant::now() + QUEUE_RECHECK);
+                    self.queue_recheck_at =
+                        Some(Instant::now() + crate::model::STALE_ANSWER_RECHECK);
                     return;
                 }
                 self.queue_stale_retries = 0;
@@ -3043,12 +3253,9 @@ impl App {
                         slot => *slot = Loadable::Loaded(page.items),
                     }
                     self.library.playlists_next = next_offset;
+                    self.library.playlists_loading = next_offset.is_some();
                     if next_offset.is_some() {
                         self.load_more(Page::Home);
-                    } else {
-                        // The list is whole; ask the session how the
-                        // listener arranged it into folders.
-                        self.backend.send(Command::Rootlist);
                     }
                     if let Some(playlists) = self.library.playlists.get() {
                         for playlist in playlists {
@@ -3057,6 +3264,7 @@ impl App {
                     }
                 }
                 Err(error) => {
+                    self.library.playlists_loading = false;
                     if offset == 0 {
                         self.library.playlists = Loadable::Failed(error.to_string());
                     } else {
@@ -3191,6 +3399,7 @@ impl App {
             }
             ApiResponse::PlaylistCreated(result) => {
                 self.playlist_busy = false;
+                let creation = self.pending_playlist_creation.take().unwrap_or_default();
                 match result {
                     Ok(playlist) => {
                         self.toast(format!("Created {}", playlist.name));
@@ -3198,14 +3407,29 @@ impl App {
                             playlists.insert(0, playlist.clone());
                         }
                         self.saved.insert(playlist.uri.clone(), true);
-                        if let Some(Dialog::CreatePlaylist { add_uris, .. }) = self.dialog.take()
-                            && !add_uris.is_empty()
-                        {
+                        if matches!(self.dialog, Some(Dialog::CreatePlaylist { .. })) {
+                            self.dialog = None;
+                        }
+                        if !creation.add_uris.is_empty() {
                             self.backend.api(ApiRequest::AddToPlaylist {
                                 playlist_id: playlist.id.clone(),
                                 playlist_name: playlist.name.clone(),
-                                uris: add_uris,
+                                uris: creation.add_uris,
                             });
+                        }
+                        match creation.destination {
+                            Some(parent) => {
+                                if let Err(error) = self.change_folders(
+                                    crate::rootlist::Intent::PlaceCreatedPlaylist {
+                                        uri: playlist.uri.clone(),
+                                        parent,
+                                    },
+                                ) {
+                                    self.toast_error(format!("{CREATED_AT_ROOT} {error}"));
+                                    self.refresh_folders();
+                                }
+                            }
+                            None => self.refresh_folders(),
                         }
                         self.open(Page::Playlist(playlist.id));
                     }
@@ -3290,6 +3514,7 @@ impl App {
                         "Removed from Your Library"
                     });
                     self.load_playlists();
+                    self.refresh_folders();
                     if !followed && matches!(self.page(), Page::Playlist(current) if *current == id)
                     {
                         self.open(Page::Home);
@@ -4229,7 +4454,7 @@ impl App {
         let track_like = uri.starts_with("spotify:track:") || uri.starts_with("spotify:episode:");
         if track_like && self.local.is_active() && matches!(self.target(), Target::Local) {
             self.backend.player(PlayerCommand::AddToQueue(uri));
-            self.queue_recheck_at = Some(Instant::now() + QUEUE_RECHECK);
+            self.queue_recheck_at = Some(Instant::now() + crate::model::STALE_ANSWER_RECHECK);
             return;
         }
         let device_id = match self.target() {
@@ -4598,12 +4823,18 @@ impl App {
                 name,
                 public,
                 add_uris,
+                destination,
             } => {
                 self.playlist_busy = true;
+                self.pending_playlist_creation = Some(PlaylistCreation {
+                    add_uris: add_uris.clone(),
+                    destination,
+                });
                 self.dialog = Some(Dialog::CreatePlaylist {
                     name: name.clone(),
                     public,
                     add_uris,
+                    destination,
                 });
                 self.backend.api(ApiRequest::CreatePlaylist {
                     name,
@@ -4635,6 +4866,18 @@ impl App {
                 self.backend
                     .api(ApiRequest::FollowPlaylist { id, follow: false });
             }
+            Action::ToggleFolder(id) => {
+                if !self.expanded_folders.remove(&id) {
+                    self.expanded_folders.insert(id);
+                }
+                self.session_dirty = true;
+            }
+            Action::ChangeFolders(intent) => {
+                if let Err(error) = self.change_folders(intent) {
+                    self.toast_error(error);
+                }
+            }
+            Action::RefreshFolders => self.refresh_folders(),
             Action::Transfer(device_id) => self.transfer(device_id),
             Action::ActivateReceiver(receiver) => {
                 if self.activating_receiver.is_none() {
@@ -5216,19 +5459,50 @@ impl App {
     fn save_session(&mut self) {
         self.session_dirty = false;
         self.last_session_save = Instant::now();
+        self.folders
+            .retain_known_expanded(&mut self.expanded_folders);
         if let Some(now) = self.now_playing() {
             self.resume_context = self.playing_context_uri();
             self.resume_track = Some(now.uri.clone());
             self.resume_position_ms = now.position_ms;
         }
         if !self.offline {
+            let mut expanded_folders = self
+                .expanded_folders
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            expanded_folders.sort();
+            let mut collapsed_folders = self
+                .legacy_collapsed_folders
+                .as_ref()
+                .map(|folders| folders.iter().map(ToString::to_string).collect::<Vec<_>>())
+                .or_else(|| {
+                    // The shown snapshot (cached before the first load) keeps
+                    // the downgrade field populated even before Spotify answers.
+                    self.folders.shown_snapshot().map(|snapshot| {
+                        snapshot
+                            .folders()
+                            .into_iter()
+                            .filter(|folder| !self.expanded_folders.contains(&folder.id))
+                            .map(|folder| folder.id.to_string())
+                            .collect()
+                    })
+                })
+                .unwrap_or_default();
+            collapsed_folders.sort();
             SessionState {
                 last_page: Some(self.page().encode()),
                 recent_contexts: self.recent_contexts.clone(),
                 last_context: self.resume_context.clone(),
                 last_track: self.resume_track.clone(),
                 last_position_ms: self.resume_position_ms,
-                collapsed_folders: self.collapsed_folders.clone(),
+                collapsed_folders,
+                expanded_folders: self
+                    .legacy_collapsed_folders
+                    .is_none()
+                    .then_some(expanded_folders),
+                folder_account_id: self.folder_state_account.clone(),
                 last_added_queue: if self.resume_queue.is_empty() {
                     self.manual_queue.clone()
                 } else {
@@ -5809,7 +6083,7 @@ mod tests {
         );
 
         // Spotify telling the same story every time eventually wins.
-        for _ in 0..QUEUE_STALE_RETRIES {
+        for _ in 0..crate::model::STALE_ANSWER_RETRIES {
             app.handle_api(ApiResponse::Queue {
                 seq: app.queue_seq,
                 result: Ok(stale.clone()),
@@ -6170,6 +6444,183 @@ mod tests {
         );
     }
 
+    #[test]
+    fn folders_start_collapsed_and_restore_expanded_state() {
+        let root = std::env::temp_dir().join(format!(
+            "fastpotify-folder-restart-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let dirs = AppDirs {
+            config: root.join("config"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+        };
+        let options = AppOptions {
+            media_controls: false,
+            tray: false,
+        };
+        let snapshot = crate::rootlist::Snapshot::parse(&[
+            "spotify:start-group:1:One".into(),
+            "spotify:playlist:a".into(),
+            "spotify:end-group:1".into(),
+            "spotify:start-group:2:Two".into(),
+            "spotify:end-group:2".into(),
+        ])
+        .unwrap();
+        let one = "1".parse().unwrap();
+        let mut app = App::new(
+            &Waker::default(),
+            dirs.clone(),
+            Settings::default(),
+            options,
+        );
+        app.folders.set_demo("account", snapshot.clone());
+        app.reconcile_folder_state("account");
+        assert!(app.expanded_folders.is_empty());
+        let rows = app
+            .folders
+            .shown_snapshot()
+            .unwrap()
+            .project_rows(&app.expanded_folders, &[]);
+        assert!(rows.iter().all(|row| {
+            !matches!(row, crate::rootlist::Row::Playlist { .. })
+                && matches!(
+                    row,
+                    crate::rootlist::Row::Folder {
+                        collapsed: true,
+                        ..
+                    }
+                )
+        }));
+
+        app.apply(Action::ToggleFolder(one), &egui::Context::default());
+        app.save_session();
+        app.backend.shutdown();
+
+        let options = AppOptions {
+            media_controls: false,
+            tray: false,
+        };
+        let mut restored = App::new(&Waker::default(), dirs, Settings::default(), options);
+        restored.reset_data();
+        restored.folders.set_demo("account", snapshot);
+        restored.reconcile_folder_state("account");
+        assert_eq!(restored.expanded_folders, HashSet::from([one]));
+        restored.backend.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn legacy_collapsed_folders_migrate_without_changing_state() {
+        let root = std::env::temp_dir().join(format!(
+            "fastpotify-folder-migration-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let dirs = AppDirs {
+            config: root.join("config"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+        };
+        SessionState {
+            collapsed_folders: vec!["2".into()],
+            ..SessionState::default()
+        }
+        .save(&dirs.session_file());
+        let options = AppOptions {
+            media_controls: false,
+            tray: false,
+        };
+        let mut app = App::new(
+            &Waker::default(),
+            dirs.clone(),
+            Settings::default(),
+            options,
+        );
+        app.folders.set_demo(
+            "account",
+            crate::rootlist::Snapshot::parse(&[
+                "spotify:start-group:1:One".into(),
+                "spotify:end-group:1".into(),
+                "spotify:start-group:2:Two".into(),
+                "spotify:end-group:2".into(),
+            ])
+            .unwrap(),
+        );
+        app.reconcile_folder_state("account");
+
+        assert_eq!(app.expanded_folders, HashSet::from(["1".parse().unwrap()]));
+        app.save_session();
+        let migrated = SessionState::load(&dirs.session_file());
+        assert_eq!(
+            migrated.expanded_folders,
+            Some(vec!["0000000000000001".into()])
+        );
+        assert_eq!(migrated.folder_account_id.as_deref(), Some("account"));
+        app.backend.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The cached hierarchy only bridges the wait for the session; once
+    /// folder access is known to be unavailable it must not linger read-only.
+    #[test]
+    fn cached_folders_vanish_when_access_becomes_unavailable() {
+        let mut app = headless_app();
+        app.folders.reset();
+        app.auth = AuthStatus::Connected {
+            username: "Listener".into(),
+        };
+        app.user = Some(crate::api::models::User {
+            id: "account".into(),
+            ..Default::default()
+        });
+        app.local_playback = LocalPlayback::Connecting;
+        let cached = crate::rootlist::Snapshot::parse(&[
+            "spotify:start-group:0000000000000001:Cached".into(),
+            "spotify:end-group:0000000000000001".into(),
+        ])
+        .unwrap();
+        assert!(app.folders.install_cache(cached));
+        assert!(app.folders.shown_snapshot().is_some());
+
+        app.handle_playback(LocalPlayback::Failed("no credential".into()));
+        assert_eq!(app.folder_access(), FolderAccess::Unavailable);
+        assert!(app.folders.shown_snapshot().is_none());
+        app.backend.shutdown();
+    }
+
+    #[test]
+    fn folders_load_when_playback_ready_arrives_last() {
+        let mut app = headless_app();
+        app.folders.reset();
+        app.auth = AuthStatus::Connected {
+            username: "Listener".into(),
+        };
+        app.user = Some(crate::api::models::User {
+            id: "account".into(),
+            ..Default::default()
+        });
+        app.local_ready = false;
+        app.local_playback = LocalPlayback::Connecting;
+        app.local.connected = true;
+        app.local.username = "account".into();
+
+        assert_eq!(app.folder_access(), FolderAccess::Starting);
+        app.handle_playback(LocalPlayback::Ready {
+            device_id: "device".into(),
+        });
+        assert!(app.folders.is_loading());
+
+        app.folders
+            .finish_refresh("account".into(), Err("unavailable".into()));
+        app.load_folders_when_ready();
+        assert!(!app.folders.is_loading());
+        app.refresh_folders();
+        assert!(app.folders.is_loading());
+        app.backend.shutdown();
+    }
+
     /// Saving the queue writes the playing song and every row after it,
     /// each song once, in playing order.
     #[test]
@@ -6194,6 +6645,87 @@ mod tests {
             vec!["spotify:track:a", "spotify:track:b", "spotify:track:c"],
             "the playing song leads and a repeat wrap adds nothing"
         );
+        app.save_queue_as_playlist();
+        let Some(Action::CreatePlaylist {
+            add_uris,
+            destination,
+            ..
+        }) = app.actions.pop()
+        else {
+            panic!("saving the queue did not use playlist creation");
+        };
+        assert_eq!(
+            add_uris,
+            vec!["spotify:track:a", "spotify:track:b", "spotify:track:c"]
+        );
+        assert_eq!(destination, None);
+    }
+
+    #[test]
+    fn playlist_folder_destination_survives_a_closed_creation_dialog() {
+        let mut app = headless_app();
+        app.backend.set_offline(true);
+        app.user = Some(crate::api::models::User {
+            id: "account".into(),
+            ..Default::default()
+        });
+        app.auth = AuthStatus::Connected {
+            username: "Listener".into(),
+        };
+        app.local_playback = LocalPlayback::Ready {
+            device_id: "device".into(),
+        };
+        app.local.connected = true;
+        app.local.username = "account".into();
+        let folder = "1".parse().unwrap();
+        app.folders.set_demo(
+            "account",
+            crate::rootlist::Snapshot::parse(&[
+                "spotify:start-group:1:Folder".into(),
+                "spotify:end-group:1".into(),
+            ])
+            .unwrap(),
+        );
+        let ctx = egui::Context::default();
+        app.apply(
+            Action::CreatePlaylist {
+                name: "Saved".into(),
+                public: false,
+                add_uris: vec!["spotify:track:a".into()],
+                destination: Some(folder),
+            },
+            &ctx,
+        );
+        app.apply(Action::CloseDialog, &ctx);
+        assert!(app.dialog.is_none());
+        assert_eq!(
+            app.pending_playlist_creation
+                .as_ref()
+                .map(|creation| creation.add_uris.as_slice()),
+            Some(["spotify:track:a".to_string()].as_slice())
+        );
+
+        app.handle_api(ApiResponse::PlaylistCreated(Ok(
+            crate::api::models::Playlist {
+                id: "new".into(),
+                name: "Saved".into(),
+                uri: "spotify:playlist:new".into(),
+                ..Default::default()
+            },
+        )));
+
+        assert!(app.folders.is_placing_created_playlist());
+        assert_eq!(
+            app.folders
+                .shown_snapshot()
+                .unwrap()
+                .parent_of(&crate::rootlist::Node::Playlist(
+                    "spotify:playlist:new".into()
+                ))
+                .unwrap(),
+            Some(folder)
+        );
+        assert!(matches!(app.page(), Page::Playlist(id) if id == "new"));
     }
 
     /// A saved song radio is named after its song; any other queue is

@@ -427,33 +427,125 @@ impl Engine {
     /// The account's playlist tree, the way Spotify's own clients read
     /// it: playlist rows in the listener's order, with markers around each
     /// folder.
-    pub async fn rootlist(&self) -> Result<Vec<RootlistEntry>> {
+    pub async fn rootlist(&self) -> Result<crate::rootlist::Snapshot> {
         use protobuf::Message as _;
-        let mut uris = Vec::new();
-        let mut from = 0usize;
+        let mut builder = crate::rootlist::SnapshotBuilder::default();
         loop {
             let bytes = self
                 .session
                 .spclient()
-                .get_rootlist(from, Some(500))
+                .get_rootlist(builder.next_offset(), Some(2_000))
                 .await
                 .map_err(|error| anyhow!("rootlist: {error}"))?;
             let content =
                 librespot_protocol::playlist4_external::SelectedListContent::parse_from_bytes(
                     &bytes,
                 )?;
-            let Some(contents) = content.contents.into_option() else {
-                break;
-            };
-            let count = contents.items.len();
-            let truncated = contents.truncated();
-            uris.extend(contents.items.into_iter().filter_map(|item| item.uri));
-            if !truncated || count == 0 {
+            if !builder.push(content)? {
                 break;
             }
-            from += count;
         }
-        Ok(parse_rootlist(&uris))
+        builder.finish()
+    }
+
+    pub fn username(&self) -> String {
+        self.session.username()
+    }
+
+    pub async fn change_rootlist(
+        &self,
+        http: &reqwest::Client,
+        account_id: &str,
+        mutation: &crate::rootlist::Mutation,
+    ) -> crate::rootlist::SendOutcome {
+        use crate::rootlist::SendOutcome;
+
+        if self.username() != account_id {
+            return SendOutcome::NotSent("The playback and Web API accounts do not match".into());
+        }
+        let base =
+            match tokio::time::timeout(Duration::from_secs(15), self.session.spclient().base_url())
+                .await
+            {
+                Ok(Ok(base)) => base,
+                Ok(Err(error)) => {
+                    return SendOutcome::NotSent(format!("Couldn't resolve Spotify: {error}"));
+                }
+                Err(_) => return SendOutcome::NotSent("Spotify token setup timed out".into()),
+            };
+        let token =
+            match tokio::time::timeout(Duration::from_secs(15), self.session.login5().auth_token())
+                .await
+            {
+                Ok(Ok(token)) => token,
+                Ok(Err(error)) => {
+                    return SendOutcome::NotSent(format!(
+                        "Couldn't authorize the folder change: {error}"
+                    ));
+                }
+                Err(_) => return SendOutcome::NotSent("Spotify token setup timed out".into()),
+            };
+        let client_token = tokio::time::timeout(
+            Duration::from_secs(15),
+            self.session.spclient().client_token(),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok);
+        let url = format!(
+            "{base}/playlist/v2/user/{account_id}/rootlist/changes?product=0&country={}&salt={}",
+            self.session.country(),
+            rand::random::<u32>()
+        );
+        let mut request = http
+            .post(url)
+            .header(reqwest::header::CONTENT_TYPE, "application/x-protobuf")
+            .header(
+                reqwest::header::AUTHORIZATION,
+                format!("{} {}", token.token_type, token.access_token),
+            )
+            .body(mutation.body().to_vec());
+        if let Some(client_token) = client_token {
+            request = request.header("client-token", client_token);
+        }
+        let request = match request.build() {
+            Ok(request) => request,
+            Err(error) => {
+                return SendOutcome::NotSent(format!(
+                    "Couldn't prepare the folder change: {error}"
+                ));
+            }
+        };
+        let response =
+            match tokio::time::timeout(Duration::from_secs(30), http.execute(request)).await {
+                Ok(Ok(response)) => response,
+                Ok(Err(error)) => {
+                    return SendOutcome::Uncertain(format!(
+                        "The folder change may have reached Spotify: {error}"
+                    ));
+                }
+                Err(_) => {
+                    return SendOutcome::Uncertain(
+                        "The folder change timed out and may have reached Spotify".into(),
+                    );
+                }
+            };
+        let status = response.status();
+        if status.is_success() {
+            return SendOutcome::Accepted;
+        }
+        let body = response.text().await.unwrap_or_default();
+        let detail = body.chars().take(512).collect::<String>();
+        let message = if detail.trim().is_empty() {
+            format!("Spotify rejected the folder change with {status}")
+        } else {
+            format!("Spotify rejected the folder change with {status}: {detail}")
+        };
+        if status.is_client_error() && status.as_u16() != 408 {
+            SendOutcome::Rejected(message)
+        } else {
+            SendOutcome::Uncertain(message)
+        }
     }
 
     /// The display name behind a user id, from the profile view Spotify's
@@ -783,112 +875,8 @@ fn local_track(item: &AudioItem) -> LocalTrack {
     }
 }
 
-/// One row of the account's playlist tree.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RootlistEntry {
-    /// A playlist, by its URI.
-    Playlist(String),
-    /// A folder opens; everything until its end sits inside it.
-    FolderStart {
-        id: String,
-        name: String,
-    },
-    FolderEnd,
-}
-
-/// The rootlist's rows from its URIs: playlists pass through, and the
-/// `start-group`/`end-group` markers Spotify brackets folders with become
-/// folder rows, their names percent-decoded.
-pub fn parse_rootlist(uris: &[String]) -> Vec<RootlistEntry> {
-    let mut entries = Vec::new();
-    let mut depth = 0usize;
-    for uri in uris {
-        if let Some(rest) = uri.strip_prefix("spotify:start-group:") {
-            let (id, name) = match rest.split_once(':') {
-                Some((id, name)) => (id.to_string(), decode_folder_name(name)),
-                None => (rest.to_string(), String::new()),
-            };
-            entries.push(RootlistEntry::FolderStart { id, name });
-            depth += 1;
-        } else if uri.starts_with("spotify:end-group:") {
-            if depth > 0 {
-                entries.push(RootlistEntry::FolderEnd);
-                depth -= 1;
-            }
-        } else if uri.starts_with("spotify:playlist:") {
-            entries.push(RootlistEntry::Playlist(uri.clone()));
-        }
-    }
-    // A folder Spotify never closed still closes here.
-    entries.extend(std::iter::repeat_n(RootlistEntry::FolderEnd, depth));
-    entries
-}
-
-/// Folder names arrive percent-encoded, with `+` for a space.
-fn decode_folder_name(encoded: &str) -> String {
-    let bytes = encoded.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b'%' if i + 2 < bytes.len() => match u8::from_str_radix(&encoded[i + 1..i + 3], 16) {
-                Ok(byte) => {
-                    out.push(byte);
-                    i += 3;
-                }
-                Err(_) => {
-                    out.push(b'%');
-                    i += 1;
-                }
-            },
-            byte => {
-                out.push(byte);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn the_rootlist_markers_become_folders() {
-        let uris: Vec<String> = [
-            "spotify:playlist:aaa",
-            "spotify:start-group:f1:Late%20Night+Mix",
-            "spotify:playlist:bbb",
-            "spotify:playlist:ccc",
-            "spotify:end-group:f1",
-            "spotify:playlist:ddd",
-            "spotify:start-group:f2:Open",
-            "spotify:playlist:eee",
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        let rows = parse_rootlist(&uris);
-        assert_eq!(
-            rows[0],
-            RootlistEntry::Playlist("spotify:playlist:aaa".into())
-        );
-        assert_eq!(
-            rows[1],
-            RootlistEntry::FolderStart {
-                id: "f1".into(),
-                name: "Late Night Mix".into()
-            }
-        );
-        assert_eq!(rows[4], RootlistEntry::FolderEnd);
-        // The unclosed folder still closes.
-        assert_eq!(rows.last(), Some(&RootlistEntry::FolderEnd));
-        assert_eq!(rows.len(), 9);
-    }
-
     use super::*;
     use librespot_core::SpotifyUri;
 

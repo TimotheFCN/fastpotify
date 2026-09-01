@@ -20,7 +20,7 @@ Fastpotify follows each platform's conventions. On Linux:
 | Audio cache | `~/.cache/fastpotify/audio/` | Always |
 | Artwork cache | `~/.cache/fastpotify/art/` | Always |
 | Lyrics cache | `~/.cache/fastpotify/lyrics/` | Always |
-| Account-scoped playlist cache | `~/.cache/fastpotify/playlists/<account-id>/` | Always |
+| Account-scoped playlist and folder cache | `~/.cache/fastpotify/playlists/<account-id>/` | Always |
 | Last run's log | `~/.local/state/fastpotify/fastpotify.log` | Always |
 | Crash log | `~/.local/state/fastpotify/panic.log` | Always |
 
@@ -28,6 +28,9 @@ Clearing caches never signs you out; credentials live in *state*, not
 *cache*. Web API token files are written with owner-only permissions.
 Signing out from Settings deletes both Web API grants and the separate
 playback credential.
+
+The last-session file stores the playlist folders left open for the signed-in
+account. Folders without saved state start collapsed.
 
 On macOS, settings, state, and the logs are in
 `~/Library/Application Support/me.paolino.fastpotify` and the caches in
@@ -101,8 +104,8 @@ interface work. Demo mode never writes settings.
 
 `--demo-page` opens a page, such as `home`, `playlist:pl1`, or `artist:art0`,
 and `--demo-show` adds surfaces on top of it: a comma separated list of
-`queue`, `devices`, `shortcuts`, `premium`, `create`, `light`, `focus`, `winamp`,
-`playlist`, `eq`, `eq-shade`, and `compact`.
+`queue`, `devices`, `shortcuts`, `premium`, `create`, `folders`, `light`,
+`focus`, `winamp`, `playlist`, `eq`, `eq-shade`, and `compact`.
 
 `--demo-shot <PATH>` writes the window to a PNG and exits, which is how the
 screenshots in these pages are made:

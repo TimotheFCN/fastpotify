@@ -46,15 +46,31 @@ context menu, drag a row into the block to pin it where you drop it,
 drag within the block to reorder it, and drag a pinned row below the
 block to unpin it.
 
-Below the pins, the sidebar starts out sorting playlists by when you
-last played them. Drag one to a new place and the rest of the shelf
-switches to your own order instead: rows stay exactly where you drop
-them, and new playlists wait just under the pins until you place them.
-Choose **Sort by recently played** from any playlist's context menu to
-go back; dragging a row switches to your own order again.
+Below the pins, the Playlists shelf follows Spotify's own folder
+hierarchy and order. The **+** button makes a playlist or a folder, a
+folder's or playlist's menu moves it to another folder, and dragging a
+row drops it before a sibling, into a folder, or back at the root.
+Deleting a folder keeps its playlists in Your Library. Every one of these
+changes reaches Spotify's other clients. A pinned playlist stays a
+shortcut at the top: dragging the shortcut moves the pin, not the
+playlist. Folders start collapsed, and the ones you open are open again
+next time.
 
-The Albums, Artists, and Podcasts shelves pin the same way: drag into
-the block, within it, or below it.
+Folders need playback and the Web API signed in to the same account, so
+use **Enable** beside the sidebar's folder note to start playback again
+after a full sign-out. Until playback is up, the last hierarchy stays on
+screen but cannot be changed, and filtering the shelf lists playlists
+flat, because hidden siblings would make a drop ambiguous.
+
+Without a hierarchy the shelf falls back to a flat list, sorting
+playlists by when you last played them. Drag one to a new place and the
+rest of the shelf switches to your own order instead: rows stay exactly
+where you drop them, and new playlists wait just under the pins until you
+place them. Choose **Sort by recently played** from any playlist's
+context menu to go back.
+
+The Albums, Artists, and Podcasts shelves pin the same way: drag into the
+block, within it, or below it.
 
 Use the chips to filter the sidebar by Playlists, Albums, Artists, or Podcasts,
 or use the magnifier to search it. Liked Songs stays at the top. The current

@@ -24,6 +24,7 @@ pub mod model;
 pub mod paths;
 pub mod player;
 pub mod resample;
+pub mod rootlist;
 pub mod settings;
 pub mod single_instance;
 pub mod sink;

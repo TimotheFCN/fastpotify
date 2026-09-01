@@ -81,3 +81,19 @@ The engine discovers access points through `apresolve.spotify.com` and
 connects over TCP in the resolver's preference order: port 4070 first,
 falling back to 443 and 80. Only outbound connections are needed; no
 inbound ports have to be open.
+
+## Playlist folders
+
+Spotify's public Web API does not expose playlist folders. When the live
+streaming session belongs to the same account as the Web API sign-in,
+Fastpotify reads the private rootlist endpoint through librespot. Folder
+changes use the same session token and a single protobuf POST through
+Fastpotify's HTTP client. The client never retries that POST. It reads the
+rootlist back until Spotify confirms the requested change.
+
+If the accounts do not match, playback is disconnected, or the private
+response is malformed, Fastpotify stops writing folders. It caches the last
+complete rootlist per account so the hierarchy can appear while the session
+starts; that cache only bridges the wait, and Fastpotify discards it on
+sign-out or once folders turn out to be unreachable, leaving the sidebar its
+flat playlist shelf. Fastpotify never polls this endpoint.

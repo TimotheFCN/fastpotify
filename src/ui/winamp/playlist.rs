@@ -755,6 +755,7 @@ fn list_menu(app: &mut App, ui: &mut egui::Ui, rows: &[Row], queue_uris: &[Strin
             name: app.queue_playlist_name(),
             public: false,
             add_uris: uris,
+            destination: None,
         });
     }
 }

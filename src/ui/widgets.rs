@@ -279,11 +279,10 @@ pub fn item_menu(
             ui.set_min_width(220.0);
             ui.set_max_width(300.0);
             if menu_item(ui, &palette, Some(Icon::Plus), "New playlist") {
-                app.actions.push(Action::ShowDialog(Dialog::CreatePlaylist {
-                    name: String::new(),
-                    public: false,
-                    add_uris: vec![uri.clone()],
-                }));
+                app.actions.push(Action::ShowDialog(Dialog::create_playlist(
+                    vec![uri.clone()],
+                    None,
+                )));
             }
             if !playlists.is_empty() {
                 menu_separator(ui, &palette);

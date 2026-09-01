@@ -264,6 +264,8 @@ pub fn populate(app: &mut App) {
     app.local_playback = crate::backend::LocalPlayback::Ready {
         device_id: "local-demo".into(),
     };
+    app.local.connected = true;
+    app.local.username = "demo".into();
     app.user = Some(User {
         id: "demo".into(),
         display_name: Some("Carmine".into()),
@@ -597,6 +599,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
                     name: "Autumn drives".into(),
                     public: false,
                     add_uris: vec!["spotify:track:trk1".into()],
+                    destination: None,
                 })
             }
             "light" => {
@@ -637,28 +640,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
             }
             "presets" => app.winamp.open_presets = true,
             "art" => app.settings.art_expanded = true,
-            "folders" => {
-                use crate::player::RootlistEntry;
-                let uri = |index: usize| format!("spotify:playlist:pl{index}");
-                app.rootlist = vec![
-                    RootlistEntry::FolderStart {
-                        id: "f1".into(),
-                        name: "Focus".into(),
-                    },
-                    RootlistEntry::Playlist(uri(1)),
-                    RootlistEntry::Playlist(uri(2)),
-                    RootlistEntry::FolderEnd,
-                    RootlistEntry::FolderStart {
-                        id: "f2".into(),
-                        name: "Weekend".into(),
-                    },
-                    RootlistEntry::Playlist(uri(3)),
-                    RootlistEntry::FolderEnd,
-                    RootlistEntry::Playlist(uri(4)),
-                    RootlistEntry::Playlist(uri(5)),
-                ];
-                app.collapsed_folders = vec!["f2".into()];
-            }
+            "folders" => install_folder_fixture(app),
             "small" => app.settings.skin_scale = Some(1),
             "compact" => {
                 app.settings.sidebar_compact = true;
@@ -765,6 +747,24 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
             _ => {}
         }
     }
+}
+
+fn install_folder_fixture(app: &mut App) {
+    let playlist = |index: usize| format!("spotify:playlist:pl{index}");
+    let uris = vec![
+        "spotify:start-group:f1:Focus".into(),
+        playlist(1),
+        "spotify:start-group:f2:Weekend".into(),
+        playlist(2),
+        "spotify:end-group:f2".into(),
+        playlist(3),
+        "spotify:end-group:f1".into(),
+        playlist(4),
+        playlist(5),
+    ];
+    app.folders
+        .set_demo("demo", crate::rootlist::Snapshot::parse(&uris).unwrap());
+    app.expanded_folders.insert("f1".parse().unwrap());
 }
 
 #[cfg(test)]
@@ -1072,6 +1072,21 @@ mod tests {
                 name: "x".into(),
                 public: true,
                 add_uris: vec![],
+                destination: None,
+            },
+            Dialog::EditFolder {
+                folder: None,
+                parent: None,
+                name: "x".into(),
+            },
+            Dialog::MoveToFolder {
+                node: crate::rootlist::Node::Playlist("spotify:playlist:pl1".into()),
+                current: None,
+                query: String::new(),
+            },
+            Dialog::ConfirmDeleteFolder {
+                folder: "1".parse().unwrap(),
+                name: "x".into(),
             },
             Dialog::EditPlaylist {
                 id: "pl1".into(),
@@ -1210,6 +1225,7 @@ mod tests {
                 &ctx,
                 DragEntry {
                     uri: "spotify:playlist:pl4".into(),
+                    folder: None,
                     title: "Release Radar".into(),
                     image: None,
                 },
@@ -1242,6 +1258,77 @@ mod tests {
             ],
         );
         assert!(app.settings.sidebar_order.is_empty());
+        app.backend.shutdown();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dropping_on_a_collapsed_folder_moves_the_playlist_inside() {
+        let root = std::env::temp_dir().join(format!(
+            "fastpotify-folder-drop-test-{}",
+            std::process::id()
+        ));
+        let dirs = AppDirs {
+            config: root.join("config"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+        };
+        let ctx = egui::Context::default();
+        let waker = crate::backend::Waker::default();
+        waker.attach(&ctx);
+        let mut app = App::new(
+            &waker,
+            dirs,
+            Settings::default(),
+            AppOptions {
+                media_controls: false,
+                tray: false,
+            },
+        );
+        app.attach(&ctx);
+        populate(&mut app);
+        let folder: crate::rootlist::FolderId = "f2".parse().unwrap();
+        let playlist = "spotify:playlist:pl4";
+
+        let mut dropped = false;
+        for y in (100..700).step_by(4) {
+            install_folder_fixture(&mut app);
+            let pos = egui::pos2(120.0, y as f32);
+            egui::DragAndDrop::set_payload(
+                &ctx,
+                DragEntry {
+                    uri: playlist.into(),
+                    folder: None,
+                    title: "Release Radar".into(),
+                    image: None,
+                },
+            );
+            frame_events(&ctx, &mut app, vec![egui::Event::PointerMoved(pos)]);
+            frame_events(
+                &ctx,
+                &mut app,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                }],
+            );
+            egui::DragAndDrop::clear_payload(&ctx);
+            dropped = app.folders.shown_snapshot().is_some_and(|snapshot| {
+                snapshot
+                    .parent_of(&crate::rootlist::Node::Playlist(playlist.into()))
+                    .is_ok_and(|parent| parent == Some(folder))
+            });
+            if dropped {
+                break;
+            }
+        }
+
+        assert!(
+            dropped,
+            "no sweep position landed inside the collapsed folder"
+        );
         app.backend.shutdown();
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1288,6 +1375,7 @@ mod tests {
                 &ctx,
                 DragEntry {
                     uri: "spotify:playlist:pl4".into(),
+                    folder: None,
                     title: "Release Radar".into(),
                     image: None,
                 },

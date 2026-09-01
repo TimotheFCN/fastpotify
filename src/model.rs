@@ -1,9 +1,16 @@
 //! Interface-side state: what is open, what is loaded, what was asked for.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::api::models::*;
+
+/// How long to wait before asking again, when Spotify answers with a
+/// snapshot from before a change made here.
+pub const STALE_ANSWER_RECHECK: Duration = Duration::from_millis(700);
+/// How many stale answers are asked again before Spotify's version of
+/// events wins anyway.
+pub const STALE_ANSWER_RETRIES: u8 = 6;
 
 /// Every screen the central panel can show.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -264,6 +271,7 @@ impl<T> CursorList<T> {
 #[derive(Default)]
 pub struct Library {
     pub playlists: Loadable<Vec<Playlist>>,
+    pub playlists_loading: bool,
     pub playlists_next: Option<u32>,
     pub liked: PagedList<SavedTrack>,
     pub albums: PagedList<SavedAlbum>,
@@ -472,8 +480,31 @@ pub struct DragTrack {
 #[derive(Clone, Debug)]
 pub struct DragEntry {
     pub uri: String,
+    pub folder: Option<crate::rootlist::FolderId>,
     pub title: String,
     pub image: Option<String>,
+}
+
+impl Dialog {
+    pub fn create_playlist(
+        add_uris: Vec<String>,
+        destination: Option<crate::rootlist::FolderId>,
+    ) -> Self {
+        Self::CreatePlaylist {
+            name: String::new(),
+            public: false,
+            add_uris,
+            destination,
+        }
+    }
+
+    pub fn create_folder(parent: Option<crate::rootlist::FolderId>) -> Self {
+        Self::EditFolder {
+            folder: None,
+            parent,
+            name: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -482,6 +513,21 @@ pub enum Dialog {
         name: String,
         public: bool,
         add_uris: Vec<String>,
+        destination: Option<crate::rootlist::FolderId>,
+    },
+    EditFolder {
+        folder: Option<crate::rootlist::FolderId>,
+        parent: Option<crate::rootlist::FolderId>,
+        name: String,
+    },
+    MoveToFolder {
+        node: crate::rootlist::Node,
+        current: Option<crate::rootlist::FolderId>,
+        query: String,
+    },
+    ConfirmDeleteFolder {
+        folder: crate::rootlist::FolderId,
+        name: String,
     },
     EditPlaylist {
         id: String,
@@ -576,6 +622,7 @@ pub enum Action {
         name: String,
         public: bool,
         add_uris: Vec<String>,
+        destination: Option<crate::rootlist::FolderId>,
     },
     UpdatePlaylist {
         id: String,
@@ -584,6 +631,9 @@ pub enum Action {
         public: bool,
     },
     DeletePlaylist(String),
+    ToggleFolder(crate::rootlist::FolderId),
+    ChangeFolders(crate::rootlist::Intent),
+    RefreshFolders,
     Transfer(String),
     /// Hand the account to a receiver found on the local network.
     ActivateReceiver(Box<crate::zeroconf::Receiver>),
