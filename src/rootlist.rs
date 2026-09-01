@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use librespot_protocol::playlist4_external::{
     Add, Delta, Item as WireItem, ListChanges, Mov, Op, Rem, SelectedListContent, UpdateItemUris,
     UriReplacement, op::Kind,
@@ -179,8 +179,14 @@ impl Snapshot {
         Ok(self.parent_at(span.start))
     }
 
+    /// True when the rootlist lists this playlist exactly once; a duplicated
+    /// playlist cannot be moved unambiguously.
     pub fn contains_playlist(&self, uri: &str) -> bool {
-        self.playlist_uris().filter(|held| *held == uri).count() == 1
+        self.playlist_uris()
+            .filter(|held| *held == uri)
+            .take(2)
+            .count()
+            == 1
     }
 
     pub fn playlist_uris(&self) -> impl Iterator<Item = &str> {
@@ -192,14 +198,38 @@ impl Snapshot {
 
     pub fn valid_folder_destinations(&self, node: &Node) -> Result<Vec<Folder>> {
         let source = self.resolve_node(node)?;
-        Ok(self
-            .folders()
-            .into_iter()
-            .filter(|folder| {
-                self.folder_start(folder.id)
-                    .is_some_and(|start| start < source.start || start > source.end)
-            })
-            .collect())
+        let mut folders = Vec::new();
+        let mut stack = Vec::new();
+        for (index, item) in self.items.iter().enumerate() {
+            match item {
+                RootlistItem::FolderStart { id, name, .. } => {
+                    if index < source.start || index > source.end {
+                        folders.push(Folder {
+                            id: *id,
+                            name: name.clone(),
+                            depth: stack.len() as u8,
+                            parent: stack.last().copied(),
+                        });
+                    }
+                    stack.push(*id);
+                }
+                RootlistItem::FolderEnd { .. } => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+        Ok(folders)
+    }
+
+    /// Whether `parent` may receive `node`: both exist and the destination is
+    /// not the node itself or one of its descendants.
+    pub fn is_valid_destination(&self, node: &Node, parent: FolderId) -> bool {
+        let Ok(source) = self.resolve_node(node) else {
+            return false;
+        };
+        self.folder_start(parent)
+            .is_some_and(|start| start < source.start || start > source.end)
     }
 
     pub fn folder_contents(&self, id: FolderId) -> Result<FolderContents> {
@@ -220,7 +250,7 @@ impl Snapshot {
     }
 
     pub fn project_rows(&self, expanded: &HashSet<FolderId>, pinned: &[String]) -> Vec<Row> {
-        let pinned: HashSet<&str> = pinned.iter().map(String::as_str).collect();
+        let pinned_set: HashSet<&str> = pinned.iter().map(String::as_str).collect();
         let mut counts: HashMap<FolderId, usize> = HashMap::new();
         let mut stack = Vec::new();
         for item in &self.items {
@@ -238,12 +268,12 @@ impl Snapshot {
             }
         }
 
+        // Pinned rows keep the user's pin order; the set is only for lookups.
         let mut rows = pinned
             .iter()
             .map(|uri| Row::Playlist {
-                uri: (*uri).to_string(),
+                uri: uri.clone(),
                 depth: 0,
-                pinned: true,
             })
             .collect::<Vec<_>>();
         let mut depth = 0u8;
@@ -273,12 +303,11 @@ impl Snapshot {
                     }
                 }
                 RootlistItem::Playlist { uri }
-                    if hidden_at.is_none() && !pinned.contains(uri.as_str()) =>
+                    if hidden_at.is_none() && !pinned_set.contains(uri.as_str()) =>
                 {
                     rows.push(Row::Playlist {
                         uri: uri.clone(),
                         depth,
-                        pinned: false,
                     });
                 }
                 RootlistItem::Unknown { uri } if hidden_at.is_none() => rows.push(Row::Unknown {
@@ -412,16 +441,16 @@ impl Snapshot {
         }
         let (_, destination) = self.destination(parent, before.as_ref())?;
         let moving = self.items[source.start..=source.end].to_vec();
+        let mut mov = Mov::new();
+        mov.items = moving.iter().map(|item| wire_item(item.uri())).collect();
         let mut projected = self.clone();
         projected.items.drain(source.start..=source.end);
         let insert_at = destination.index_in(&projected)?;
-        projected.items.splice(insert_at..insert_at, moving.clone());
+        projected.items.splice(insert_at..insert_at, moving);
         if projected == *self {
             return Ok(None);
         }
 
-        let mut mov = Mov::new();
-        mov.items = moving.iter().map(|item| wire_item(item.uri())).collect();
         set_move_destination(&mut mov, &destination);
         Ok(Some(Plan::new(
             projected,
@@ -464,25 +493,18 @@ impl Snapshot {
             bail!("created playlist has an invalid URI");
         }
         let destination = Destination::Before(self.folder_end_uri(parent)?.to_string());
-        let matches = self
-            .items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| matches!(item, RootlistItem::Playlist { uri: held } if held == uri))
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        if matches.len() > 1 {
-            bail!("created playlist occurs more than once");
-        }
-        if matches.len() == 1
-            && self.parent_at(matches[0]) == Some(parent)
-            && self.is_last_child(matches[0], Some(parent))
+        let existing = self
+            .unique_playlist_index(uri)
+            .map_err(|_| anyhow!("created playlist occurs more than once"))?;
+        if let Some(index) = existing
+            && self.parent_at(index) == Some(parent)
+            && self.is_last_child(index, Some(parent))
         {
             return Ok(None);
         }
 
         let mut projected = self.clone();
-        if let Some(index) = matches.first().copied() {
+        if let Some(index) = existing {
             projected.items.remove(index);
         }
         let at = destination.index_in(&projected)?;
@@ -526,23 +548,29 @@ impl Snapshot {
         }
     }
 
+    /// Index of the playlist when it occurs exactly once, `Ok(None)` when it
+    /// is absent, and an error when it is duplicated.
+    fn unique_playlist_index(&self, uri: &str) -> Result<Option<usize>> {
+        let mut indices = self.items.iter().enumerate().filter_map(|(index, item)| {
+            matches!(item, RootlistItem::Playlist { uri: held } if held == uri).then_some(index)
+        });
+        let first = indices.next();
+        if indices.next().is_some() {
+            bail!("playlist occurs more than once");
+        }
+        Ok(first)
+    }
+
     fn resolve_node(&self, node: &Node) -> Result<Span> {
         match node {
             Node::Folder(id) => self.folder_span(*id),
             Node::Playlist(uri) => {
-                let matches = self
-                    .items
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, item)| matches!(item, RootlistItem::Playlist { uri: held } if held == uri))
-                    .map(|(index, _)| index)
-                    .collect::<Vec<_>>();
-                if matches.len() != 1 {
+                let Some(index) = self.unique_playlist_index(uri)? else {
                     bail!("playlist must occur exactly once");
-                }
+                };
                 Ok(Span {
-                    start: matches[0],
-                    end: matches[0],
+                    start: index,
+                    end: index,
                 })
             }
         }
@@ -587,10 +615,11 @@ impl Snapshot {
 
     fn is_last_child(&self, index: usize, parent: Option<FolderId>) -> bool {
         let end = match parent {
-            Some(parent) => self
-                .folder_span(parent)
-                .map(|span| span.end)
-                .unwrap_or_default(),
+            Some(parent) => match self.folder_span(parent) {
+                Ok(span) => span.end,
+                // A vanished parent cannot have a last child.
+                Err(_) => return false,
+            },
             None => self.items.len(),
         };
         let span = match &self.items[index] {
@@ -650,7 +679,6 @@ pub enum Row {
     Playlist {
         uri: String,
         depth: u8,
-        pinned: bool,
     },
     Unknown {
         uri: String,
@@ -818,6 +846,9 @@ impl FolderState {
                 if self.confirmed.get().is_none() {
                     self.confirmed = Loadable::Failed(error.clone());
                 }
+                // Spotify could not be reached, so stop showing a hierarchy
+                // the user cannot interact with.
+                self.cached = None;
                 self.last_error = Some(error);
             }
         }
@@ -840,7 +871,7 @@ impl FolderState {
         let mutation = plan.mutation.clone();
         self.work = FolderWork::Mutating(PendingChange {
             projected: plan.projected,
-            mutation: mutation.clone(),
+            mutation: plan.mutation,
         });
         self.last_error = None;
         Ok(mutation)
@@ -888,13 +919,19 @@ impl FolderState {
         }
     }
 
+    /// The cache only bridges the wait for the first live rootlist; once
+    /// Spotify has answered (either way) it is no longer trusted.
     pub fn install_cache(&mut self, snapshot: Snapshot) -> bool {
-        if self.confirmed.get().is_none() {
+        if matches!(self.confirmed, Loadable::NotLoaded | Loadable::Loading) {
             self.cached = Some(snapshot);
             true
         } else {
             false
         }
+    }
+
+    pub fn drop_cache(&mut self) -> bool {
+        self.cached.take().is_some()
     }
 
     fn pending_mutation(&self) -> Option<&Mutation> {
@@ -1006,16 +1043,11 @@ impl Postcondition {
                 before,
             } => snapshot.position_satisfied(node, *parent, before.as_ref()),
             Self::FolderAbsent(id) => !snapshot.has_folder(*id),
-            Self::CreatedPlaylist { uri, parent } => {
-                let matches = snapshot
-                    .items
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, item)| matches!(item, RootlistItem::Playlist { uri: held } if held == uri))
-                    .map(|(index, _)| index)
-                    .collect::<Vec<_>>();
-                matches.len() == 1 && snapshot.parent_at(matches[0]) == Some(*parent)
-            }
+            Self::CreatedPlaylist { uri, parent } => snapshot
+                .unique_playlist_index(uri)
+                .ok()
+                .flatten()
+                .is_some_and(|index| snapshot.parent_at(index) == Some(*parent)),
         }
     }
 }
@@ -1149,11 +1181,14 @@ fn decode_name(encoded: &str) -> Result<String> {
                 decoded.push(u8::from_str_radix(digits, 16).context("invalid percent escape")?);
                 index += 3;
             }
-            byte if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') => {
+            // Other clients may leave bytes like `!` or `(` unescaped. A name
+            // never round-trips through Fastpotify's own encoder unless the
+            // user renames the folder, so accept any literal byte; only a
+            // malformed percent escape is a structural failure.
+            byte => {
                 decoded.push(byte);
                 index += 1;
             }
-            _ => bail!("folder name is not form encoded"),
         }
     }
     Ok(String::from_utf8(decoded)?)
@@ -1363,6 +1398,36 @@ mod tests {
     }
 
     #[test]
+    fn pinned_rows_keep_pin_order() {
+        let tree = snapshot(&[
+            "spotify:playlist:a",
+            "spotify:playlist:b",
+            "spotify:playlist:c",
+        ]);
+        let rows = tree.project_rows(
+            &HashSet::new(),
+            &["spotify:playlist:c".into(), "spotify:playlist:a".into()],
+        );
+        assert_eq!(
+            rows,
+            vec![
+                Row::Playlist {
+                    uri: "spotify:playlist:c".into(),
+                    depth: 0,
+                },
+                Row::Playlist {
+                    uri: "spotify:playlist:a".into(),
+                    depth: 0,
+                },
+                Row::Playlist {
+                    uri: "spotify:playlist:b".into(),
+                    depth: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn rows_keep_spotify_order_counts_collapse_and_pinned_shortcuts() {
         let tree = snapshot(&[
             "spotify:start-group:1:Outer",
@@ -1380,7 +1445,6 @@ mod tests {
                 Row::Playlist {
                     uri: "spotify:playlist:b".into(),
                     depth: 0,
-                    pinned: true
                 },
                 Row::Folder {
                     id: id("1"),
@@ -1392,7 +1456,6 @@ mod tests {
                 Row::Playlist {
                     uri: "spotify:playlist:a".into(),
                     depth: 1,
-                    pinned: false
                 },
                 Row::Folder {
                     id: id("2"),
@@ -1404,7 +1467,6 @@ mod tests {
                 Row::Playlist {
                     uri: "spotify:playlist:c".into(),
                     depth: 0,
-                    pinned: false
                 },
             ]
         );
@@ -1726,12 +1788,15 @@ mod tests {
         assert!(!state.install_cache(cached));
         assert_eq!(state.shown_snapshot(), Some(&live));
 
+        // A failed refresh drops the cache and refuses a late-arriving one:
+        // an unreachable hierarchy must not linger read-only.
         let mut failed = FolderState::default();
+        assert!(failed.install_cache(live.clone()));
         assert!(failed.begin_refresh());
         failed.finish_refresh("account".into(), Err("offline".into()));
-        assert!(failed.install_cache(live.clone()));
-        assert_eq!(failed.shown_snapshot(), Some(&live));
-        assert!(failed.confirmed_snapshot().is_none());
+        assert!(failed.shown_snapshot().is_none());
+        assert!(!failed.install_cache(live));
+        assert!(failed.shown_snapshot().is_none());
         assert!(!failed.writable(Some("account"), Some("account")));
     }
 

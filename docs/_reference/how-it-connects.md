@@ -94,5 +94,6 @@ rootlist back until Spotify confirms the requested change.
 If the private response is malformed, the accounts do not match, or playback
 is disconnected, Fastpotify stops writing folders. The last complete rootlist
 is cached by account so its hierarchy can appear while the live session starts.
-This cache is display-only: folder changes remain disabled until a fresh
-rootlist arrives from Spotify. Fastpotify does not poll this endpoint.
+This cache is display-only and only bridges that wait: when folders turn out
+to be unreachable, and on sign-out, it is discarded and the sidebar falls back
+to the flat playlist shelf. Fastpotify does not poll this endpoint.

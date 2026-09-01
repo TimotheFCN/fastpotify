@@ -30,13 +30,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
             match dialog {
                 Dialog::CreatePlaylist { .. } => create_playlist(app, ui),
                 Dialog::EditFolder { .. } => edit_folder(app, ui),
-                Dialog::MoveToFolder {
-                    node,
-                    current,
-                    query,
-                } => {
-                    move_to_folder(app, ui, &node, current, query)
-                }
+                Dialog::MoveToFolder { .. } => move_to_folder(app, ui),
                 Dialog::ConfirmDeleteFolder {
                     folder,
                     name,
@@ -172,7 +166,15 @@ fn edit_folder(app: &mut App, ui: &mut egui::Ui) {
     let parent = *parent;
     dialog_footer(ui, |ui| {
         let label = if folder.is_some() { "Rename" } else { "Create" };
-        if (theme::pill_button(ui, &palette, label, true).clicked() || submit) && !name.is_empty() {
+        let clicked = ui
+            .scope(|ui| {
+                if name.is_empty() {
+                    ui.set_opacity(0.5);
+                }
+                theme::pill_button(ui, &palette, label, true).clicked()
+            })
+            .inner;
+        if (clicked || submit) && !name.is_empty() {
             let intent = match folder {
                 Some(folder) => crate::rootlist::Intent::RenameFolder {
                     folder,
@@ -189,27 +191,31 @@ fn edit_folder(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
-fn move_to_folder(
-    app: &mut App,
-    ui: &mut egui::Ui,
-    node: &crate::rootlist::Node,
-    current: Option<crate::rootlist::FolderId>,
-    mut query: String,
-) {
+fn move_to_folder(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
+    let Some(Dialog::MoveToFolder {
+        node,
+        current,
+        query,
+    }) = &mut app.dialog
+    else {
+        return;
+    };
+    let node = node.clone();
+    let current = *current;
     theme::text(ui, "Move to folder", theme::bold(20.0), palette.text);
     ui.add_space(12.0);
     let folders = app
         .folders
         .confirmed_snapshot()
-        .and_then(|snapshot| snapshot.valid_folder_destinations(node).ok())
+        .and_then(|snapshot| snapshot.valid_folder_destinations(&node).ok())
         .unwrap_or_default();
     if folders.len() > 6 || !query.is_empty() {
         super::widgets::search_field(
             ui,
             &palette,
             egui::Id::new("folder-destination-search"),
-            &mut query,
+            query,
             "Find a folder",
             ui.available_width(),
         );
@@ -243,7 +249,7 @@ fn move_to_folder(
                 if folder_destination_row(
                     ui,
                     &palette,
-                    crate::theme::Icon::Library,
+                    crate::theme::Icon::Folder,
                     name,
                     folder.depth.saturating_add(1),
                     current == Some(folder.id),
@@ -262,14 +268,11 @@ fn move_to_folder(
     if let Some(parent) = choice {
         app.actions
             .push(Action::ChangeFolders(crate::rootlist::Intent::Move {
-                node: node.clone(),
+                node,
                 parent,
                 before: None,
             }));
         app.actions.push(Action::CloseDialog);
-    }
-    if let Some(Dialog::MoveToFolder { query: held, .. }) = &mut app.dialog {
-        *held = query;
     }
     ui.add_space(16.0);
     dialog_footer(ui, |ui| {
@@ -481,6 +484,19 @@ fn delete_folder(
             ));
             app.actions.push(Action::CloseDialog);
         }
+    } else {
+        ui.add_space(8.0);
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(
+                    "Some of this folder's contents aren't loaded yet, \
+                     so only the folder itself can be deleted from here.",
+                )
+                .font(theme::regular(12.5))
+                .color(palette.secondary),
+            )
+            .wrap(),
+        );
     }
     ui.add_space(16.0);
     dialog_footer(ui, |ui| {
@@ -563,8 +579,15 @@ fn create_playlist(app: &mut App, ui: &mut egui::Ui) {
         if busy {
             theme::spinner(ui, 18.0, palette.accent);
         } else {
-            let create = theme::pill_button(ui, &palette, "Create", true).clicked() || submit;
-            if create && !name_value.is_empty() {
+            let clicked = ui
+                .scope(|ui| {
+                    if name_value.is_empty() {
+                        ui.set_opacity(0.5);
+                    }
+                    theme::pill_button(ui, &palette, "Create", true).clicked()
+                })
+                .inner;
+            if (clicked || submit) && !name_value.is_empty() {
                 app.actions.push(Action::CreatePlaylist {
                     name: name_value.clone(),
                     public: public_value,

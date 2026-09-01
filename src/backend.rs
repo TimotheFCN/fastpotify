@@ -443,6 +443,10 @@ pub enum Command {
     Lyrics(Box<LyricsRequest>),
     /// Read or change the account's playlist tree through the session.
     Rootlist(RootlistRequest),
+    /// Forget the on-disk rootlist cache (folders became unreachable).
+    DropRootlistCache {
+        account_id: String,
+    },
     /// Internal: one serialized rootlist job ended.
     RootlistFinished {
         account_id: String,
@@ -885,6 +889,7 @@ impl Worker {
                 Command::CheckForUpdates => self.check_for_updates(),
                 Command::Lyrics(request) => self.fetch_lyrics(*request),
                 Command::Rootlist(request) => self.rootlist(request),
+                Command::DropRootlistCache { account_id } => self.drop_rootlist_cache(&account_id),
                 Command::RootlistFinished {
                     account_id,
                     result,
@@ -1164,6 +1169,9 @@ impl Worker {
         }
         self.authorizing_source = None;
         self.pending_authorization = None;
+        if let Some(account) = self.api.account() {
+            let _ = std::fs::remove_file(self.dirs.account_rootlist_cache_file(account.as_str()));
+        }
         self.api.clear_all();
         crate::auth::StoredToken::remove(&self.dirs.shared_web_token_file());
         crate::auth::StoredToken::remove(&self.dirs.personal_web_token_file());
@@ -1601,6 +1609,9 @@ impl Worker {
                 last_snapshot: Some(snapshot),
                 ..
             }) => self.store_rootlist_cache(&account_id, snapshot),
+            // An unreachable rootlist must not linger on disk, or the next
+            // start would show folders that cannot be interacted with.
+            RootlistResult::Refreshed(Err(_)) => self.drop_rootlist_cache(&account_id),
             _ => {}
         }
         self.emit(Event::Rootlist {
@@ -1687,6 +1698,13 @@ impl Worker {
                 snapshot,
             });
             waker.wake();
+        });
+    }
+
+    fn drop_rootlist_cache(&self, account_id: &str) {
+        let path = self.dirs.account_rootlist_cache_file(account_id);
+        tokio::spawn(async move {
+            let _ = tokio::fs::remove_file(path).await;
         });
     }
 
@@ -2268,12 +2286,15 @@ async fn run_rootlist_mutation(
     let detail = last_error
         .or(send_note)
         .unwrap_or_else(|| "Spotify kept returning the previous folder order".into());
+    // A readback that never produced a snapshot did not refresh anything, so
+    // it must not swallow a refresh queued behind the mutation.
+    let refreshed = last_snapshot.is_some();
     (
         MutationOutcome::Unknown {
             last_snapshot,
             error: format!("Spotify did not confirm the folder change: {detail}"),
         },
-        true,
+        refreshed,
     )
 }
 

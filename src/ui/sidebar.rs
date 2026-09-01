@@ -182,9 +182,10 @@ fn folder_rows(app: &App, user_id: &str, entries: &mut Vec<Entry>) {
     let Some(snapshot) = app.folders.shown_snapshot() else {
         return;
     };
-    let listed = snapshot
-        .playlist_uris()
-        .collect::<std::collections::HashSet<_>>();
+    let mut listed = std::collections::HashMap::<&str, u32>::new();
+    for uri in snapshot.playlist_uris() {
+        *listed.entry(uri).or_default() += 1;
+    }
     for row in snapshot.project_rows(&app.expanded_folders, &app.settings.pinned_contexts) {
         match row {
             crate::rootlist::Row::Folder {
@@ -216,7 +217,7 @@ fn folder_rows(app: &App, user_id: &str, entries: &mut Vec<Entry>) {
                 let Some((index, playlist)) = by_uri.get(uri.as_str()) else {
                     continue;
                 };
-                let in_rootlist = snapshot.contains_playlist(&uri);
+                let in_rootlist = listed.get(uri.as_str()) == Some(&1);
                 entries.push(playlist_entry(
                     playlist,
                     *index,
@@ -231,7 +232,7 @@ fn folder_rows(app: &App, user_id: &str, entries: &mut Vec<Entry>) {
     // Playlists the rootlist has not met yet, the newly followed, wait at
     // the end rather than vanish.
     for (index, playlist) in playlists.iter().enumerate() {
-        if !listed.contains(playlist.uri.as_str()) {
+        if !listed.contains_key(playlist.uri.as_str()) {
             entries.push(playlist_entry(playlist, index, user_id, 0, false));
         }
     }
@@ -359,12 +360,8 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                                 destination: None,
                             }));
                         }
-                        if super::widgets::menu_item(
-                            ui,
-                            &palette,
-                            Some(Icon::Library),
-                            "New folder",
-                        ) {
+                        if super::widgets::menu_item(ui, &palette, Some(Icon::Folder), "New folder")
+                        {
                             app.actions.push(Action::ShowDialog(Dialog::EditFolder {
                                 folder: None,
                                 parent: None,
@@ -653,53 +650,67 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
     let playing_context = app.playing_context_uri();
     let context_playing = app.believed_playing();
     let current_page = app.page().clone();
-    let folder_access_starting = filter == Filter::Playlists && app.folders_starting();
-    let folders_starting = folder_access_starting && app.folders.shown_snapshot().is_none();
+    // Folder access is still resolving; only show a loading row when there is
+    // no snapshot (cached or fresh) to draw in the meantime.
+    let folder_access_pending = filter == Filter::Playlists && app.folders_starting();
+    let folders_loading_row = folder_access_pending && app.folders.shown_snapshot().is_none();
 
     egui::ScrollArea::vertical()
         .id_salt("sidebar-list")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            if loading || folders_starting {
+            if loading || folders_loading_row {
                 super::widgets::loading_row(ui, &palette);
             }
             if filter == Filter::Playlists
                 && app.folders.confirmed_snapshot().is_none()
                 && !app.folders.is_loading()
-                && !folder_access_starting
+                && !folder_access_pending
             {
-                ui.horizontal(|ui| {
+                // A quiet indication, not an alert: playlists still work, only
+                // the folder arrangement is waiting on something.
+                let needs_playback = matches!(
+                    app.local_playback,
+                    crate::backend::LocalPlayback::Unavailable
+                        | crate::backend::LocalPlayback::Failed(_)
+                );
+                let other_account = matches!(
+                    app.local_playback,
+                    crate::backend::LocalPlayback::Ready { .. }
+                ) && app.local.connected;
+                let (text, remedy) = if needs_playback {
+                    (
+                        "Playlist folders appear once playback is enabled.",
+                        Some(("Enable", Action::EnablePlayback)),
+                    )
+                } else if other_account {
+                    (
+                        "Playback runs on another account, so playlist folders stay hidden.",
+                        None,
+                    )
+                } else {
+                    (
+                        "Spotify didn't list your playlist folders.",
+                        Some(("Retry", Action::RefreshFolders)),
+                    )
+                };
+                ui.horizontal_wrapped(|ui| {
                     ui.add_space(8.0);
-                    theme::icon(ui, Icon::CircleAlert, 16.0, palette.danger);
-                    theme::text(
-                        ui,
-                        "Folders unavailable",
-                        theme::regular(13.0),
-                        palette.secondary,
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(text)
+                                .font(theme::regular(12.5))
+                                .color(palette.dim),
+                        )
+                        .wrap(),
                     );
-                    let needs_playback = matches!(
-                        app.local_playback,
-                        crate::backend::LocalPlayback::Unavailable
-                            | crate::backend::LocalPlayback::Failed(_)
-                    );
-                    let label = if needs_playback {
-                        "Enable playback"
-                    } else {
-                        "Retry"
-                    };
-                    let icon = if needs_playback {
-                        Icon::Play
-                    } else {
-                        Icon::Refresh
-                    };
-                    if theme::soft_button(ui, &palette, Some(icon), label, false).clicked() {
-                        app.actions.push(if needs_playback {
-                            Action::EnablePlayback
-                        } else {
-                            Action::RefreshFolders
-                        });
+                    if let Some((label, action)) = remedy
+                        && theme::soft_button(ui, &palette, None, label, false).clicked()
+                    {
+                        app.actions.push(action);
                     }
                 });
+                ui.add_space(4.0);
             }
             if let Some(error) = &error {
                 super::widgets::error_row(ui, app, error, None);
@@ -873,7 +884,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                                 Vec2::splat(16.0),
                             ),
                         );
-                        Icon::Library.image(palette.secondary, 20.0).paint_at(
+                        Icon::Folder.image(palette.secondary, 20.0).paint_at(
                             ui,
                             Rect::from_center_size(
                                 pos2(left + 30.0, rect.center().y),
@@ -1097,20 +1108,19 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                         app.actions.push(Action::Open(entry.page.clone()));
                     }
                 }
-                if let Some((folder, _)) = entry.folder() {
-                    let current = app.folders.confirmed_snapshot().and_then(|snapshot| {
-                        snapshot
-                            .parent_of(&crate::rootlist::Node::Folder(folder))
-                            .ok()
-                    });
-                    let delete = folder_delete_details(app, folder);
+                if let Some((folder, _)) = entry.folder()
+                    && app.folders_writable()
+                {
                     egui::Popup::context_menu(&response)
                         .width(220.0)
                         .frame(super::widgets::menu_frame(&palette))
                         .show(|ui| {
-                            if !app.folders_writable() {
-                                return;
-                            }
+                            let current = app.folders.confirmed_snapshot().and_then(|snapshot| {
+                                snapshot
+                                    .parent_of(&crate::rootlist::Node::Folder(folder))
+                                    .ok()
+                            });
+                            let delete = folder_delete_details(app, folder);
                             if super::widgets::menu_item(
                                 ui,
                                 &palette,
@@ -1127,7 +1137,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                             if super::widgets::menu_item(
                                 ui,
                                 &palette,
-                                Some(Icon::Library),
+                                Some(Icon::Folder),
                                 "Create folder here",
                             ) {
                                 app.actions.push(Action::ShowDialog(Dialog::EditFolder {
@@ -1148,7 +1158,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                                 ui,
                                 &palette,
                                 Some(Icon::ArrowRight),
-                                "Move",
+                                "Move to folder",
                             ) {
                                 app.actions.push(Action::ShowDialog(Dialog::MoveToFolder {
                                     node: crate::rootlist::Node::Folder(folder),
@@ -1185,21 +1195,6 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                                 .and_then(|list| list.get(index))
                                 .cloned()
                         });
-                    let move_parent = app
-                        .folders_writable()
-                        .then(|| app.folders.confirmed_snapshot())
-                        .flatten()
-                        .filter(|snapshot| snapshot.contains_playlist(&entry.uri))
-                        .and_then(|snapshot| {
-                            snapshot
-                                .parent_of(&crate::rootlist::Node::Playlist(entry.uri.clone()))
-                                .ok()
-                        });
-                    let can_move = app.folders_writable()
-                        && app
-                            .folders
-                            .confirmed_snapshot()
-                            .is_some_and(|snapshot| snapshot.contains_playlist(&entry.uri));
                     egui::Popup::context_menu(&response)
                         .frame(super::widgets::menu_frame(&palette))
                         .show(|ui| {
@@ -1210,7 +1205,20 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                                 &entry.name,
                                 owned_playlist.as_ref(),
                             );
-                            if can_move
+                            let move_parent = app
+                                .folders_writable()
+                                .then(|| app.folders.confirmed_snapshot())
+                                .flatten()
+                                .filter(|snapshot| snapshot.contains_playlist(&entry.uri))
+                                .map(|snapshot| {
+                                    snapshot
+                                        .parent_of(&crate::rootlist::Node::Playlist(
+                                            entry.uri.clone(),
+                                        ))
+                                        .ok()
+                                        .flatten()
+                                });
+                            if let Some(current) = move_parent
                                 && super::widgets::menu_item(
                                     ui,
                                     &palette,
@@ -1220,7 +1228,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                             {
                                 app.actions.push(Action::ShowDialog(Dialog::MoveToFolder {
                                     node: crate::rootlist::Node::Playlist(entry.uri.clone()),
-                                    current: move_parent.flatten(),
+                                    current,
                                     query: String::new(),
                                 }));
                             }
@@ -1381,9 +1389,7 @@ fn valid_folder_drop(app: &App, drag: &DragEntry, parent: crate::rootlist::Folde
     let Some(node) = drag_node(drag) else {
         return false;
     };
-    snapshot
-        .valid_folder_destinations(&node)
-        .is_ok_and(|folders| folders.iter().any(|folder| folder.id == parent))
+    snapshot.is_valid_destination(&node, parent)
 }
 
 fn drop_rootlist_row(
@@ -1420,9 +1426,7 @@ fn drop_rootlist_row(
         None => None,
     };
     if let Some(parent) = parent
-        && !snapshot
-            .valid_folder_destinations(&node)
-            .is_ok_and(|folders| folders.iter().any(|folder| folder.id == parent))
+        && !snapshot.is_valid_destination(&node, parent)
     {
         return;
     }

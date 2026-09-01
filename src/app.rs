@@ -34,6 +34,8 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(280);
 const RESTART_BEFORE_PREVIOUS: u32 = 3_000;
 
 const TOAST_LIFETIME: Duration = Duration::from_millis(3200);
+// Shown whenever placing a just-created playlist into a folder fails.
+const CREATED_AT_ROOT: &str = "Spotify created the playlist at the root.";
 const OPTIMISTIC_HOLD: Duration = Duration::from_millis(2500);
 
 /// How long a context the app just started is shown as playing while
@@ -1076,9 +1078,7 @@ impl App {
                             self.folders.finish_mutation(outcome);
                             if let Some(error) = error {
                                 if placed_playlist {
-                                    self.toast_error(format!(
-                                        "Spotify created the playlist at the root. {error}"
-                                    ));
+                                    self.toast_error(format!("{CREATED_AT_ROOT} {error}"));
                                 } else {
                                     self.toast_error(error);
                                 }
@@ -2190,6 +2190,18 @@ impl App {
     fn load_folders_when_ready(&mut self) {
         if self.folders.needs_initial_load() {
             self.refresh_folders();
+        }
+        // The cache only bridges the wait for the session. Once folder access
+        // is known to be unavailable, showing cached folders would present a
+        // hierarchy the user cannot touch, so it goes and playlists fall back
+        // to the flat shelf.
+        if matches!(self.folder_access(), FolderAccess::Unavailable)
+            && self.folders.drop_cache()
+            && let Some(account_id) = self.user_id()
+        {
+            self.backend.send(Command::DropRootlistCache {
+                account_id: account_id.to_string(),
+            });
         }
     }
 
@@ -3385,16 +3397,14 @@ impl App {
                                         parent,
                                     },
                                 ) {
-                                    self.toast_error(format!(
-                                        "Spotify created the playlist at the root. {error}"
-                                    ));
+                                    self.toast_error(format!("{CREATED_AT_ROOT} {error}"));
                                     self.refresh_folders();
                                 }
                             }
                             Some(_) => {
-                                self.toast_error(
-                                    "Spotify created the playlist at the root because folders became unavailable",
-                                );
+                                self.toast_error(format!(
+                                    "{CREATED_AT_ROOT} Folders became unavailable."
+                                ));
                                 self.refresh_folders();
                             }
                             None => self.refresh_folders(),
@@ -5439,7 +5449,9 @@ impl App {
                 .as_ref()
                 .map(|folders| folders.iter().map(ToString::to_string).collect::<Vec<_>>())
                 .or_else(|| {
-                    self.folders.confirmed_snapshot().map(|snapshot| {
+                    // The shown snapshot (cached before the first load) keeps
+                    // the downgrade field populated even before Spotify answers.
+                    self.folders.shown_snapshot().map(|snapshot| {
                         snapshot
                             .folders()
                             .into_iter()
@@ -6519,6 +6531,34 @@ mod tests {
         assert_eq!(migrated.folder_account_id.as_deref(), Some("account"));
         app.backend.shutdown();
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The cached hierarchy only bridges the wait for the session; once
+    /// folder access is known to be unavailable it must not linger read-only.
+    #[test]
+    fn cached_folders_vanish_when_access_becomes_unavailable() {
+        let mut app = headless_app();
+        app.folders.reset();
+        app.auth = AuthStatus::Connected {
+            username: "Listener".into(),
+        };
+        app.user = Some(crate::api::models::User {
+            id: "account".into(),
+            ..Default::default()
+        });
+        app.local_playback = LocalPlayback::Connecting;
+        let cached = crate::rootlist::Snapshot::parse(&[
+            "spotify:start-group:0000000000000001:Cached".into(),
+            "spotify:end-group:0000000000000001".into(),
+        ])
+        .unwrap();
+        assert!(app.folders.install_cache(cached));
+        assert!(app.folders.shown_snapshot().is_some());
+
+        app.handle_playback(LocalPlayback::Failed("no credential".into()));
+        assert_eq!(app.folder_access(), FolderAccess::Unavailable);
+        assert!(app.folders.shown_snapshot().is_none());
+        app.backend.shutdown();
     }
 
     #[test]
