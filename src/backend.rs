@@ -736,18 +736,9 @@ struct RootlistLane {
 }
 
 impl RootlistLane {
-    fn begin_refresh(&mut self) -> bool {
+    fn begin(&mut self, refresh: bool) -> bool {
         if self.busy {
-            self.pending_refresh = true;
-            false
-        } else {
-            self.busy = true;
-            true
-        }
-    }
-
-    fn begin_mutation(&mut self) -> bool {
-        if self.busy {
+            self.pending_refresh |= refresh;
             false
         } else {
             self.busy = true;
@@ -1556,7 +1547,7 @@ impl Worker {
 
         match request {
             RootlistRequest::Refresh { .. } => {
-                if !self.rootlist_lane.begin_refresh() {
+                if !self.rootlist_lane.begin(true) {
                     return;
                 }
                 let commands = self.commands.clone();
@@ -1573,7 +1564,7 @@ impl Worker {
                 });
             }
             RootlistRequest::Mutate { mutation, .. } => {
-                if !self.rootlist_lane.begin_mutation() {
+                if !self.rootlist_lane.begin(false) {
                     self.emit(Event::Rootlist {
                         account_id,
                         result: RootlistResult::Mutated(crate::rootlist::MutationOutcome::NotSent(
@@ -2317,12 +2308,12 @@ mod tests {
     #[test]
     fn rootlist_lane_coalesces_refreshes_and_never_queues_mutations() {
         let mut lane = RootlistLane::default();
-        assert!(lane.begin_refresh());
-        assert!(!lane.begin_refresh());
-        assert!(!lane.begin_refresh());
-        assert!(!lane.begin_mutation());
+        assert!(lane.begin(true));
+        assert!(!lane.begin(true));
+        assert!(!lane.begin(true));
+        assert!(!lane.begin(false));
         assert!(lane.finish(false));
-        assert!(lane.begin_refresh());
+        assert!(lane.begin(true));
         assert!(!lane.finish(false));
     }
 
@@ -2347,9 +2338,9 @@ mod tests {
     #[test]
     fn mutation_readback_satisfies_a_pending_refresh() {
         let mut lane = RootlistLane::default();
-        assert!(lane.begin_mutation());
-        assert!(!lane.begin_refresh());
+        assert!(lane.begin(false));
+        assert!(!lane.begin(true));
         assert!(!lane.finish(true));
-        assert!(lane.begin_refresh());
+        assert!(lane.begin(true));
     }
 }

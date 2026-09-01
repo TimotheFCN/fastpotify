@@ -481,6 +481,28 @@ pub struct DragEntry {
     pub image: Option<String>,
 }
 
+impl Dialog {
+    pub fn create_playlist(
+        add_uris: Vec<String>,
+        destination: Option<crate::rootlist::FolderId>,
+    ) -> Self {
+        Self::CreatePlaylist {
+            name: String::new(),
+            public: false,
+            add_uris,
+            destination,
+        }
+    }
+
+    pub fn create_folder(parent: Option<crate::rootlist::FolderId>) -> Self {
+        Self::EditFolder {
+            folder: None,
+            parent,
+            name: String::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub enum Dialog {
     CreatePlaylist {
@@ -502,8 +524,6 @@ pub enum Dialog {
     ConfirmDeleteFolder {
         folder: crate::rootlist::FolderId,
         name: String,
-        playlist_count: usize,
-        can_delete_contents: bool,
     },
     EditPlaylist {
         id: String,

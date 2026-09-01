@@ -31,19 +31,9 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 Dialog::CreatePlaylist { .. } => create_playlist(app, ui),
                 Dialog::EditFolder { .. } => edit_folder(app, ui),
                 Dialog::MoveToFolder { .. } => move_to_folder(app, ui),
-                Dialog::ConfirmDeleteFolder {
-                    folder,
-                    name,
-                    playlist_count,
-                    can_delete_contents,
-                } => delete_folder(
-                    app,
-                    ui,
-                    folder,
-                    &name,
-                    playlist_count,
-                    can_delete_contents,
-                ),
+                Dialog::ConfirmDeleteFolder { folder, name } => {
+                    delete_folder(app, ui, folder, &name)
+                }
                 Dialog::EditPlaylist { .. } => edit_playlist(app, ui),
                 Dialog::ConfirmDeletePlaylist { id, name, owned } => {
                     theme::text(ui, if owned { "Delete playlist?" } else { "Remove from Your Library?" }, theme::bold(20.0), palette.text);
@@ -130,6 +120,16 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     }
 }
 
+fn submit_button(ui: &mut egui::Ui, palette: &theme::Palette, label: &str, enabled: bool) -> bool {
+    ui.scope(|ui| {
+        if !enabled {
+            ui.set_opacity(0.5);
+        }
+        theme::pill_button(ui, palette, label, true).clicked()
+    })
+    .inner
+}
+
 fn dialog_footer(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
         ui.with_layout(Layout::right_to_left(Align::Center), content);
@@ -166,14 +166,7 @@ fn edit_folder(app: &mut App, ui: &mut egui::Ui) {
     let parent = *parent;
     dialog_footer(ui, |ui| {
         let label = if folder.is_some() { "Rename" } else { "Create" };
-        let clicked = ui
-            .scope(|ui| {
-                if name.is_empty() {
-                    ui.set_opacity(0.5);
-                }
-                theme::pill_button(ui, &palette, label, true).clicked()
-            })
-            .inner;
+        let clicked = submit_button(ui, &palette, label, !name.is_empty());
         if (clicked || submit) && !name.is_empty() {
             let intent = match folder {
                 Some(folder) => crate::rootlist::Intent::RenameFolder {
@@ -403,14 +396,7 @@ fn folder_destination_row(
     }
 }
 
-fn delete_folder(
-    app: &mut App,
-    ui: &mut egui::Ui,
-    folder: crate::rootlist::FolderId,
-    name: &str,
-    playlist_count: usize,
-    can_delete_contents: bool,
-) {
+fn delete_folder(app: &mut App, ui: &mut egui::Ui, folder: crate::rootlist::FolderId, name: &str) {
     let palette = app.palette;
     theme::text(
         ui,
@@ -421,85 +407,20 @@ fn delete_folder(
     ui.add_space(8.0);
     ui.add(
         egui::Label::new(
-            egui::RichText::new("Choose what happens to the playlists inside this folder.")
+            egui::RichText::new("Its playlists stay in Your Library.")
                 .font(theme::regular(14.0))
                 .color(palette.secondary),
         )
         .wrap(),
     );
-    ui.add_space(16.0);
-    let keep = ui
-        .add_sized(
-            [ui.available_width(), 38.0],
-            egui::Button::new(
-                egui::RichText::new("Delete folder and keep playlists")
-                    .font(theme::semibold(13.0))
-                    .color(palette.text),
-            )
-            .fill(palette.surface)
-            .stroke(Stroke::new(1.0, palette.outline))
-            .corner_radius(CornerRadius::same(8)),
-        )
-        .on_hover_cursor(egui::CursorIcon::PointingHand);
-    if keep.clicked() {
-        app.actions.push(Action::ChangeFolders(
-            crate::rootlist::Intent::DeleteFolder {
-                folder,
-                contents: false,
-            },
-        ));
-        app.actions.push(Action::CloseDialog);
-    }
-    if can_delete_contents {
-        ui.add_space(12.0);
-        theme::text(
-            ui,
-            format!(
-                "This also removes {playlist_count} playlist{} from Your Library.",
-                if playlist_count == 1 { "" } else { "s" }
-            ),
-            theme::regular(12.5),
-            palette.danger,
-        );
-        ui.add_space(6.0);
-        let delete = ui
-            .add_sized(
-                [ui.available_width(), 38.0],
-                egui::Button::new(
-                    egui::RichText::new("Delete folder and contents")
-                        .font(theme::semibold(13.0))
-                        .color(palette.danger),
-                )
-                .fill(palette.danger.gamma_multiply(0.08))
-                .stroke(Stroke::new(1.0, palette.danger.gamma_multiply(0.7)))
-                .corner_radius(CornerRadius::same(8)),
-            )
-            .on_hover_cursor(egui::CursorIcon::PointingHand);
-        if delete.clicked() {
+    ui.add_space(20.0);
+    dialog_footer(ui, |ui| {
+        if theme::pill_button(ui, &palette, "Delete", true).clicked() {
             app.actions.push(Action::ChangeFolders(
-                crate::rootlist::Intent::DeleteFolder {
-                    folder,
-                    contents: true,
-                },
+                crate::rootlist::Intent::DeleteFolder { folder },
             ));
             app.actions.push(Action::CloseDialog);
         }
-    } else {
-        ui.add_space(8.0);
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(
-                    "Some of this folder's contents aren't loaded yet, \
-                     so only the folder itself can be deleted from here.",
-                )
-                .font(theme::regular(12.5))
-                .color(palette.secondary),
-            )
-            .wrap(),
-        );
-    }
-    ui.add_space(16.0);
-    dialog_footer(ui, |ui| {
         if theme::pill_button(ui, &palette, "Cancel", false).clicked() {
             app.actions.push(Action::CloseDialog);
         }
@@ -579,14 +500,7 @@ fn create_playlist(app: &mut App, ui: &mut egui::Ui) {
         if busy {
             theme::spinner(ui, 18.0, palette.accent);
         } else {
-            let clicked = ui
-                .scope(|ui| {
-                    if name_value.is_empty() {
-                        ui.set_opacity(0.5);
-                    }
-                    theme::pill_button(ui, &palette, "Create", true).clicked()
-                })
-                .inner;
+            let clicked = submit_button(ui, &palette, "Create", !name_value.is_empty());
             if (clicked || submit) && !name_value.is_empty() {
                 app.actions.push(Action::CreatePlaylist {
                     name: name_value.clone(),

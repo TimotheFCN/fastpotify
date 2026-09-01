@@ -57,10 +57,6 @@ impl Entry {
         }
     }
 
-    fn is_folder(&self) -> bool {
-        matches!(self.kind, EntryKind::Folder { .. })
-    }
-
     fn node(&self) -> Option<crate::rootlist::Node> {
         match self.kind {
             EntryKind::Folder { id, .. } => Some(crate::rootlist::Node::Folder(id)),
@@ -353,29 +349,22 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                             Some(Icon::ListMusic),
                             "New playlist",
                         ) {
-                            app.actions.push(Action::ShowDialog(Dialog::CreatePlaylist {
-                                name: String::new(),
-                                public: false,
-                                add_uris: Vec::new(),
-                                destination: None,
-                            }));
+                            app.actions.push(Action::ShowDialog(Dialog::create_playlist(
+                                Vec::new(),
+                                None,
+                            )));
                         }
                         if super::widgets::menu_item(ui, &palette, Some(Icon::Folder), "New folder")
                         {
-                            app.actions.push(Action::ShowDialog(Dialog::EditFolder {
-                                folder: None,
-                                parent: None,
-                                name: String::new(),
-                            }));
+                            app.actions
+                                .push(Action::ShowDialog(Dialog::create_folder(None)));
                         }
                     });
             } else if create.clicked() {
-                app.actions.push(Action::ShowDialog(Dialog::CreatePlaylist {
-                    name: String::new(),
-                    public: false,
-                    add_uris: Vec::new(),
-                    destination: None,
-                }));
+                app.actions.push(Action::ShowDialog(Dialog::create_playlist(
+                    Vec::new(),
+                    None,
+                )));
             }
             if theme::icon_button(
                 ui,
@@ -650,8 +639,6 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
     let playing_context = app.playing_context_uri();
     let context_playing = app.believed_playing();
     let current_page = app.page().clone();
-    // Folder access is still resolving; only show a loading row when there is
-    // no snapshot (cached or fresh) to draw in the meantime.
     let folder_access_pending = filter == Filter::Playlists && app.folders_starting();
     let folders_loading_row = folder_access_pending && app.folders.shown_snapshot().is_none();
 
@@ -775,19 +762,16 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                     },
                 )
             });
-            let reorder_slot = row_drop_target.and_then(|target| match target {
-                RowDropTarget::Between(slot) => Some(slot),
-                RowDropTarget::Inside(_) => None,
-            });
-            let folder_drop_index = row_drop_target.and_then(|target| match target {
-                RowDropTarget::Inside(index) => Some(index),
-                RowDropTarget::Between(_) => None,
-            });
+            let (reorder_slot, folder_drop_index) = match row_drop_target {
+                Some(RowDropTarget::Between(slot)) => (Some(slot), None),
+                Some(RowDropTarget::Inside(index)) => (None, Some(index)),
+                None => (None, None),
+            };
             super::widgets::virtual_rows(ui, entries.len(), row_height, |ui, index| {
                 let entry = &entries[index];
                 let droppable = entry.is_liked() || entry.owned;
                 let drop_hover = drop_target == Some(index);
-                let active = !entry.is_folder() && entry.page == current_page;
+                let active = entry.folder().is_none() && entry.page == current_page;
                 let playing = context_playing
                     && !entry.uri.is_empty()
                     && playing_context.as_deref() == Some(entry.uri.as_str());
@@ -803,7 +787,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                 // meaning. Liked Songs stays where it is.
                 let pinned_entry = app.settings.pinned_contexts.contains(&entry.uri);
                 if !entry.is_liked()
-                    && (!entry.uri.is_empty() || entry.is_folder())
+                    && (!entry.uri.is_empty() || entry.folder().is_some())
                     && (!filtered_rootlist || pinned_entry)
                     && (!folder_mode
                         || pinned_entry
@@ -1115,24 +1099,25 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                         .width(220.0)
                         .frame(super::widgets::menu_frame(&palette))
                         .show(|ui| {
-                            let current = app.folders.confirmed_snapshot().and_then(|snapshot| {
-                                snapshot
-                                    .parent_of(&crate::rootlist::Node::Folder(folder))
-                                    .ok()
-                            });
-                            let delete = folder_delete_details(app, folder);
+                            let current = app
+                                .folders
+                                .confirmed_snapshot()
+                                .and_then(|snapshot| {
+                                    snapshot
+                                        .parent_of(&crate::rootlist::Node::Folder(folder))
+                                        .ok()
+                                })
+                                .flatten();
                             if super::widgets::menu_item(
                                 ui,
                                 &palette,
                                 Some(Icon::ListMusic),
                                 "Create playlist here",
                             ) {
-                                app.actions.push(Action::ShowDialog(Dialog::CreatePlaylist {
-                                    name: String::new(),
-                                    public: false,
-                                    add_uris: Vec::new(),
-                                    destination: Some(folder),
-                                }));
+                                app.actions.push(Action::ShowDialog(Dialog::create_playlist(
+                                    Vec::new(),
+                                    Some(folder),
+                                )));
                             }
                             if super::widgets::menu_item(
                                 ui,
@@ -1140,17 +1125,14 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                                 Some(Icon::Folder),
                                 "Create folder here",
                             ) {
-                                app.actions.push(Action::ShowDialog(Dialog::EditFolder {
-                                    folder: None,
-                                    parent: Some(folder),
-                                    name: String::new(),
-                                }));
+                                app.actions
+                                    .push(Action::ShowDialog(Dialog::create_folder(Some(folder))));
                             }
                             if super::widgets::menu_item(ui, &palette, Some(Icon::Pencil), "Rename")
                             {
                                 app.actions.push(Action::ShowDialog(Dialog::EditFolder {
                                     folder: Some(folder),
-                                    parent: current.flatten(),
+                                    parent: current,
                                     name: entry.name.clone(),
                                 }));
                             }
@@ -1162,24 +1144,16 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                             ) {
                                 app.actions.push(Action::ShowDialog(Dialog::MoveToFolder {
                                     node: crate::rootlist::Node::Folder(folder),
-                                    current: current.flatten(),
+                                    current,
                                     query: String::new(),
                                 }));
                             }
-                            if let Some((playlist_count, can_delete_contents)) = delete
-                                && super::widgets::menu_item(
-                                    ui,
-                                    &palette,
-                                    Some(Icon::Trash),
-                                    "Delete",
-                                )
+                            if super::widgets::menu_item(ui, &palette, Some(Icon::Trash), "Delete")
                             {
                                 app.actions
                                     .push(Action::ShowDialog(Dialog::ConfirmDeleteFolder {
                                         folder,
                                         name: entry.name.clone(),
-                                        playlist_count,
-                                        can_delete_contents,
                                     }));
                             }
                         });
@@ -1357,26 +1331,6 @@ fn drag_node(drag: &DragEntry) -> Option<crate::rootlist::Node> {
     drag.folder.map(crate::rootlist::Node::Folder).or_else(|| {
         (!drag.uri.is_empty()).then(|| crate::rootlist::Node::Playlist(drag.uri.clone()))
     })
-}
-
-fn folder_delete_details(app: &App, folder: crate::rootlist::FolderId) -> Option<(usize, bool)> {
-    let contents = app
-        .folders
-        .confirmed_snapshot()?
-        .folder_contents(folder)
-        .ok()?;
-    let visible = app.library.playlists.get()?;
-    let visible = visible
-        .iter()
-        .map(|playlist| playlist.uri.as_str())
-        .collect::<std::collections::HashSet<_>>();
-    let count = contents.playlist_uris.len();
-    let safe = !contents.has_unknown
-        && contents
-            .playlist_uris
-            .iter()
-            .all(|uri| visible.contains(uri.as_str()));
-    Some((count, safe))
 }
 
 fn valid_folder_drop(app: &App, drag: &DragEntry, parent: crate::rootlist::FolderId) -> bool {

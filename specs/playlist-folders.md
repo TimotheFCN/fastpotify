@@ -201,8 +201,8 @@ new account's metadata can render.
 
 UI intents refer to folder ids and playlist URIs, never indexes. The required intents are: create a
 folder under a folder or at the root, rename a folder, move a playlist or whole folder under a
-parent and optionally before one of that parent's direct children, and delete a folder while either
-keeping or removing its contents. A separate `PlaceCreatedPlaylist` intent carries the URI returned
+parent and optionally before one of that parent's direct children, and delete a folder (its
+children stay, one level further out). A separate `PlaceCreatedPlaylist` intent carries the URI returned
 by a successful `PlaylistCreated` response and its destination folder.
 
 Planning resolves each reference against the confirmed snapshot and produces the operations, a

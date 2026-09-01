@@ -49,7 +49,8 @@ block to unpin it.
 Below the pins, the Playlists shelf follows Spotify's folder hierarchy and
 order. The **+** button can create a playlist or folder. Folder and playlist
 menus can move an item to another folder, and dragging moves it before a
-sibling, into a folder, or back to the root. These changes appear in Spotify's
+sibling, into a folder, or back to the root. Deleting a folder keeps its
+playlists in Your Library. These changes appear in Spotify's
 other clients. A pinned playlist remains a shortcut at the top; dragging that
 shortcut changes the pin and does not move the playlist itself.
 
@@ -58,8 +59,8 @@ restores them after an app restart. New folders also start collapsed.
 
 Folder access needs the live playback session and Web API sign-in to belong to
 the same account. A personal Web API app does not replace playback
-authorization. Full sign-out removes that authorization, so use **Enable
-playback** beside **Folders unavailable** after signing in again. While playback
+authorization. Full sign-out removes that authorization, so use **Enable**
+beside the folder note in the sidebar after signing in again. While playback
 is starting or disconnected, the last loaded hierarchy remains visible but
 read-only. If no hierarchy has loaded yet, the shelf returns to its flat
 playlist list and its previous local order. Filtering also shows flat results

@@ -30,10 +30,6 @@ impl FolderId {
     fn random() -> Self {
         Self(rand::random())
     }
-
-    fn wire(self) -> String {
-        format!("{:016x}", self.0)
-    }
 }
 
 impl fmt::Display for FolderId {
@@ -110,9 +106,6 @@ impl Snapshot {
                     uri: uri.clone(),
                 });
             } else if let Some(raw_id) = uri.strip_prefix(END_PREFIX) {
-                if raw_id.contains(':') {
-                    bail!("malformed folder end marker {uri:?}");
-                }
                 let id = FolderId::parse(raw_id)
                     .with_context(|| format!("malformed folder end marker {uri:?}"))?;
                 let Some(open) = stack.pop() else {
@@ -138,11 +131,6 @@ impl Snapshot {
         Ok(Self { items })
     }
 
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
     pub(crate) fn uris(&self) -> impl Iterator<Item = &str> {
         self.items.iter().map(RootlistItem::uri)
     }
@@ -152,17 +140,23 @@ impl Snapshot {
     }
 
     pub fn folders(&self) -> Vec<Folder> {
+        self.folders_excluding(None)
+    }
+
+    fn folders_excluding(&self, exclude: Option<Span>) -> Vec<Folder> {
         let mut folders = Vec::new();
         let mut stack = Vec::new();
-        for item in &self.items {
+        for (index, item) in self.items.iter().enumerate() {
             match item {
                 RootlistItem::FolderStart { id, name, .. } => {
-                    folders.push(Folder {
-                        id: *id,
-                        name: name.clone(),
-                        depth: stack.len() as u8,
-                        parent: stack.last().copied(),
-                    });
+                    if exclude.is_none_or(|span| index < span.start || index > span.end) {
+                        folders.push(Folder {
+                            id: *id,
+                            name: name.clone(),
+                            depth: stack.len() as u8,
+                            parent: stack.last().copied(),
+                        });
+                    }
                     stack.push(*id);
                 }
                 RootlistItem::FolderEnd { .. } => {
@@ -182,11 +176,7 @@ impl Snapshot {
     /// True when the rootlist lists this playlist exactly once; a duplicated
     /// playlist cannot be moved unambiguously.
     pub fn contains_playlist(&self, uri: &str) -> bool {
-        self.playlist_uris()
-            .filter(|held| *held == uri)
-            .take(2)
-            .count()
-            == 1
+        self.unique_playlist_index(uri).ok().flatten().is_some()
     }
 
     pub fn playlist_uris(&self) -> impl Iterator<Item = &str> {
@@ -197,29 +187,7 @@ impl Snapshot {
     }
 
     pub fn valid_folder_destinations(&self, node: &Node) -> Result<Vec<Folder>> {
-        let source = self.resolve_node(node)?;
-        let mut folders = Vec::new();
-        let mut stack = Vec::new();
-        for (index, item) in self.items.iter().enumerate() {
-            match item {
-                RootlistItem::FolderStart { id, name, .. } => {
-                    if index < source.start || index > source.end {
-                        folders.push(Folder {
-                            id: *id,
-                            name: name.clone(),
-                            depth: stack.len() as u8,
-                            parent: stack.last().copied(),
-                        });
-                    }
-                    stack.push(*id);
-                }
-                RootlistItem::FolderEnd { .. } => {
-                    stack.pop();
-                }
-                _ => {}
-            }
-        }
-        Ok(folders)
+        Ok(self.folders_excluding(Some(self.resolve_node(node)?)))
     }
 
     /// Whether `parent` may receive `node`: both exist and the destination is
@@ -230,23 +198,6 @@ impl Snapshot {
         };
         self.folder_start(parent)
             .is_some_and(|start| start < source.start || start > source.end)
-    }
-
-    pub fn folder_contents(&self, id: FolderId) -> Result<FolderContents> {
-        let span = self.folder_span(id)?;
-        let mut playlist_uris = Vec::new();
-        let mut has_unknown = false;
-        for item in &self.items[span.start + 1..span.end] {
-            match item {
-                RootlistItem::Playlist { uri } => playlist_uris.push(uri.clone()),
-                RootlistItem::Unknown { .. } => has_unknown = true,
-                _ => {}
-            }
-        }
-        Ok(FolderContents {
-            playlist_uris,
-            has_unknown,
-        })
     }
 
     pub fn project_rows(&self, expanded: &HashSet<FolderId>, pinned: &[String]) -> Vec<Row> {
@@ -268,7 +219,6 @@ impl Snapshot {
             }
         }
 
-        // Pinned rows keep the user's pin order; the set is only for lookups.
         let mut rows = pinned
             .iter()
             .map(|uri| Row::Playlist {
@@ -329,7 +279,7 @@ impl Snapshot {
                 parent,
                 before,
             } => self.plan_move(node, parent, before),
-            Intent::DeleteFolder { folder, contents } => self.plan_delete(folder, contents),
+            Intent::DeleteFolder { folder } => self.plan_delete(folder),
             Intent::PlaceCreatedPlaylist { uri, parent } => {
                 self.plan_created_playlist(&uri, parent)
             }
@@ -346,7 +296,7 @@ impl Snapshot {
         if self.has_folder(id) {
             bail!("folder id {id} already exists");
         }
-        let raw_id = id.wire();
+        let raw_id = id.to_string();
         let start = format!("{START_PREFIX}{raw_id}:{}", encode_name(name));
         let end = format!("{END_PREFIX}{raw_id}");
         let (at, destination) = self.destination(parent, None)?;
@@ -367,11 +317,16 @@ impl Snapshot {
         );
 
         let mut add = Add::new();
-        add.items = wire_items([start.as_str(), end.as_str()]);
-        set_add_destination(&mut add, destination);
+        add.items = vec![wire_item(&start), wire_item(&end)];
+        match destination {
+            Destination::Before(uri) => add.add_before_item = Some(wire_item(&uri)).into(),
+            Destination::Last => add.set_add_last(true),
+        }
+        let mut op = operation(Kind::ADD);
+        op.add = Some(add).into();
         Ok(Some(Plan::new(
             projected,
-            wrap_add(add),
+            op,
             Postcondition::Folder {
                 id,
                 name: name.to_string(),
@@ -463,27 +418,23 @@ impl Snapshot {
         )?))
     }
 
-    fn plan_delete(&self, folder: FolderId, contents: bool) -> Result<Option<Plan>> {
+    fn plan_delete(&self, folder: FolderId) -> Result<Option<Plan>> {
         let span = self.folder_span(folder)?;
-        let removed = if contents {
-            self.items[span.start..=span.end].to_vec()
-        } else {
-            vec![self.items[span.start].clone(), self.items[span.end].clone()]
-        };
         let mut projected = self.clone();
-        if contents {
-            projected.items.drain(span.start..=span.end);
-        } else {
-            projected.items.remove(span.end);
-            projected.items.remove(span.start);
-        }
+        projected.items.remove(span.end);
+        projected.items.remove(span.start);
 
         let mut rem = Rem::new();
         rem.set_items_as_key(true);
-        rem.items = removed.iter().map(|item| wire_item(item.uri())).collect();
+        rem.items = vec![
+            wire_item(self.items[span.start].uri()),
+            wire_item(self.items[span.end].uri()),
+        ];
+        let mut op = operation(Kind::REM);
+        op.rem = Some(rem).into();
         Ok(Some(Plan::new(
             projected,
-            wrap_remove(rem),
+            op,
             Postcondition::FolderAbsent(folder),
         )?))
     }
@@ -492,7 +443,8 @@ impl Snapshot {
         if !uri.starts_with(PLAYLIST_PREFIX) {
             bail!("created playlist has an invalid URI");
         }
-        let destination = Destination::Before(self.folder_end_uri(parent)?.to_string());
+        let span = self.folder_span(parent)?;
+        let destination = Destination::Before(self.items[span.end].uri().to_string());
         let existing = self
             .unique_playlist_index(uri)
             .map_err(|_| anyhow!("created playlist occurs more than once"))?;
@@ -594,11 +546,6 @@ impl Snapshot {
         )
     }
 
-    fn folder_end_uri(&self, id: FolderId) -> Result<&str> {
-        let span = self.folder_span(id)?;
-        Ok(self.items[span.end].uri())
-    }
-
     fn parent_at(&self, index: usize) -> Option<FolderId> {
         let mut stack = Vec::new();
         for item in &self.items[..index] {
@@ -617,7 +564,6 @@ impl Snapshot {
         let end = match parent {
             Some(parent) => match self.folder_span(parent) {
                 Ok(span) => span.end,
-                // A vanished parent cannot have a last child.
                 Err(_) => return false,
             },
             None => self.items.len(),
@@ -659,12 +605,6 @@ pub struct Folder {
     pub name: String,
     pub depth: u8,
     pub parent: Option<FolderId>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FolderContents {
-    pub playlist_uris: Vec<String>,
-    pub has_unknown: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -710,7 +650,6 @@ pub enum Intent {
     },
     DeleteFolder {
         folder: FolderId,
-        contents: bool,
     },
     PlaceCreatedPlaylist {
         uri: String,
@@ -750,16 +689,6 @@ impl Plan {
             },
         })
     }
-
-    #[cfg(test)]
-    fn projected(&self) -> &Snapshot {
-        &self.projected
-    }
-
-    #[cfg(test)]
-    fn mutation(&self) -> &Mutation {
-        &self.mutation
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -787,13 +716,7 @@ enum FolderWork {
     #[default]
     Idle,
     Refreshing,
-    Mutating(PendingChange),
-}
-
-#[derive(Clone, Debug)]
-struct PendingChange {
-    projected: Snapshot,
-    mutation: Mutation,
+    Mutating(Plan),
 }
 
 #[derive(Clone, Debug)]
@@ -869,10 +792,7 @@ impl FolderState {
             bail!("playlist folders are not ready for a change");
         }
         let mutation = plan.mutation.clone();
-        self.work = FolderWork::Mutating(PendingChange {
-            projected: plan.projected,
-            mutation: plan.mutation,
-        });
+        self.work = FolderWork::Mutating(plan);
         self.last_error = None;
         Ok(mutation)
     }
@@ -1101,20 +1021,16 @@ impl SnapshotBuilder {
             bail!("Spotify returned an empty rootlist revision");
         }
         let declared = page.length() as usize;
-        match (&self.revision, self.declared) {
-            (None, None) => {
-                self.revision = Some(page.revision().to_vec());
-                self.declared = Some(declared);
+        if let Some(revision) = &self.revision {
+            if page.revision() != revision.as_slice() {
+                bail!("rootlist revision changed while reading");
             }
-            (Some(revision), Some(expected)) => {
-                if page.revision() != revision.as_slice() {
-                    bail!("rootlist revision changed while reading");
-                }
-                if declared != expected {
-                    bail!("rootlist length changed while reading");
-                }
+            if self.declared != Some(declared) {
+                bail!("rootlist length changed while reading");
             }
-            _ => unreachable!(),
+        } else {
+            self.revision = Some(page.revision().to_vec());
+            self.declared = Some(declared);
         }
 
         let Some(contents) = page.contents.as_ref() else {
@@ -1181,10 +1097,8 @@ fn decode_name(encoded: &str) -> Result<String> {
                 decoded.push(u8::from_str_radix(digits, 16).context("invalid percent escape")?);
                 index += 3;
             }
-            // Other clients may leave bytes like `!` or `(` unescaped. A name
-            // never round-trips through Fastpotify's own encoder unless the
-            // user renames the folder, so accept any literal byte; only a
-            // malformed percent escape is a structural failure.
+            // Other clients may leave bytes like `!` or `(` unescaped; accept
+            // any literal byte and only fail on a malformed percent escape.
             byte => {
                 decoded.push(byte);
                 index += 1;
@@ -1217,19 +1131,9 @@ fn wire_item(uri: &str) -> WireItem {
     item
 }
 
-fn wire_items<'a>(uris: impl IntoIterator<Item = &'a str>) -> Vec<WireItem> {
-    uris.into_iter().map(wire_item).collect()
-}
-
 fn operation(kind: Kind) -> Op {
     let mut operation = Op::new();
     operation.set_kind(kind);
-    operation
-}
-
-fn wrap_add(add: Add) -> Op {
-    let mut operation = operation(Kind::ADD);
-    operation.add = Some(add).into();
     operation
 }
 
@@ -1237,19 +1141,6 @@ fn wrap_move(mov: Mov) -> Op {
     let mut operation = operation(Kind::MOV);
     operation.mov = Some(mov).into();
     operation
-}
-
-fn wrap_remove(rem: Rem) -> Op {
-    let mut operation = operation(Kind::REM);
-    operation.rem = Some(rem).into();
-    operation
-}
-
-fn set_add_destination(add: &mut Add, destination: Destination) {
-    match destination {
-        Destination::Before(uri) => add.add_before_item = Some(wire_item(&uri)).into(),
-        Destination::Last => add.set_add_last(true),
-    }
 }
 
 fn set_move_destination(mov: &mut Mov, destination: &Destination) {
@@ -1277,7 +1168,7 @@ mod tests {
     }
 
     fn changes(plan: &Plan) -> ListChanges {
-        ListChanges::parse_from_bytes(plan.mutation().body()).unwrap()
+        ListChanges::parse_from_bytes(plan.mutation.body()).unwrap()
     }
 
     fn page(
@@ -1319,7 +1210,6 @@ mod tests {
         );
         assert_eq!(parsed.folders()[0].id, id("a"));
         assert_eq!(parsed.folders()[0].name, "Night + Day: ☕");
-        assert!(parsed.folder_contents(id("A")).unwrap().has_unknown);
     }
 
     #[test]
@@ -1369,7 +1259,7 @@ mod tests {
         empty_page.set_revision(vec![1]);
         empty_page.set_length(0);
         assert!(!empty.push(empty_page).unwrap());
-        assert!(empty.finish().unwrap().is_empty());
+        assert!(empty.finish().unwrap().uris().next().is_none());
 
         for second in [
             page(&[2], 2, 1, false, &["spotify:playlist:b"]),
@@ -1398,36 +1288,6 @@ mod tests {
     }
 
     #[test]
-    fn pinned_rows_keep_pin_order() {
-        let tree = snapshot(&[
-            "spotify:playlist:a",
-            "spotify:playlist:b",
-            "spotify:playlist:c",
-        ]);
-        let rows = tree.project_rows(
-            &HashSet::new(),
-            &["spotify:playlist:c".into(), "spotify:playlist:a".into()],
-        );
-        assert_eq!(
-            rows,
-            vec![
-                Row::Playlist {
-                    uri: "spotify:playlist:c".into(),
-                    depth: 0,
-                },
-                Row::Playlist {
-                    uri: "spotify:playlist:a".into(),
-                    depth: 0,
-                },
-                Row::Playlist {
-                    uri: "spotify:playlist:b".into(),
-                    depth: 0,
-                },
-            ]
-        );
-    }
-
-    #[test]
     fn rows_keep_spotify_order_counts_collapse_and_pinned_shortcuts() {
         let tree = snapshot(&[
             "spotify:start-group:1:Outer",
@@ -1438,10 +1298,17 @@ mod tests {
             "spotify:end-group:1",
             "spotify:playlist:c",
         ]);
-        let rows = tree.project_rows(&HashSet::from([id("1")]), &["spotify:playlist:b".into()]);
+        let rows = tree.project_rows(
+            &HashSet::from([id("1")]),
+            &["spotify:playlist:c".into(), "spotify:playlist:b".into()],
+        );
         assert_eq!(
             rows,
             vec![
+                Row::Playlist {
+                    uri: "spotify:playlist:c".into(),
+                    depth: 0,
+                },
                 Row::Playlist {
                     uri: "spotify:playlist:b".into(),
                     depth: 0,
@@ -1463,10 +1330,6 @@ mod tests {
                     depth: 1,
                     playlist_count: 1,
                     collapsed: true
-                },
-                Row::Playlist {
-                    uri: "spotify:playlist:c".into(),
-                    depth: 0,
                 },
             ]
         );
@@ -1556,18 +1419,8 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        let keep = tree
-            .plan(Intent::DeleteFolder {
-                folder: id("1"),
-                contents: false,
-            })
-            .unwrap()
-            .unwrap();
-        let remove = tree
-            .plan(Intent::DeleteFolder {
-                folder: id("1"),
-                contents: true,
-            })
+        let delete = tree
+            .plan(Intent::DeleteFolder { folder: id("1") })
             .unwrap()
             .unwrap();
         let placed = tree
@@ -1585,15 +1438,14 @@ mod tests {
             &move_playlist,
             &move_folder,
             &move_to_root,
-            &keep,
-            &remove,
+            &delete,
             &placed,
         ] {
             let changes = changes(plan);
             assert!(changes.base_revision().is_empty());
             assert_eq!(changes.deltas.len(), 1);
             assert_eq!(changes.deltas[0].ops.len(), 1);
-            assert!(plan.mutation().is_confirmed_by(plan.projected()));
+            assert!(plan.mutation.is_confirmed_by(&plan.projected));
         }
         let create_changes = changes(&create);
         let add = create_changes.deltas[0].ops[0].add.as_ref().unwrap();
@@ -1627,21 +1479,11 @@ mod tests {
                 .unwrap()
                 .add_last()
         );
-        let keep_changes = changes(&keep);
-        let rem = keep_changes.deltas[0].ops[0].rem.as_ref().unwrap();
+        let delete_changes = changes(&delete);
+        let rem = delete_changes.deltas[0].ops[0].rem.as_ref().unwrap();
         assert!(rem.items_as_key());
         assert!(!rem.has_from_index());
         assert_eq!(rem.items.len(), 2);
-        let remove_changes = changes(&remove);
-        assert_eq!(
-            remove_changes.deltas[0].ops[0]
-                .rem
-                .as_ref()
-                .unwrap()
-                .items
-                .len(),
-            3
-        );
     }
 
     #[test]
@@ -1741,7 +1583,7 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        let projected = plan.projected().clone();
+        let projected = plan.projected.clone();
         let mutation = state.begin_mutation(plan).unwrap();
         assert_eq!(state.shown_snapshot(), Some(&projected));
         assert_eq!(state.confirmed_snapshot(), Some(&original));
@@ -1788,8 +1630,6 @@ mod tests {
         assert!(!state.install_cache(cached));
         assert_eq!(state.shown_snapshot(), Some(&live));
 
-        // A failed refresh drops the cache and refuses a late-arriving one:
-        // an unreachable hierarchy must not linger read-only.
         let mut failed = FolderState::default();
         assert!(failed.install_cache(live.clone()));
         assert!(failed.begin_refresh());

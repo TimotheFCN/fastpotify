@@ -696,8 +696,6 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
                 app.dialog = Some(Dialog::ConfirmDeleteFolder {
                     folder: "f1".parse().unwrap(),
                     name: "Focus".into(),
-                    playlist_count: 3,
-                    can_delete_contents: true,
                 });
             }
             "small" => app.settings.skin_scale = Some(1),
@@ -808,7 +806,6 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
     }
 }
 
-#[cfg(any(test, feature = "demo"))]
 fn install_folder_fixture(app: &mut App) {
     let playlist = |index: usize| format!("spotify:playlist:pl{index}");
     let uris = vec![
@@ -1034,8 +1031,6 @@ mod tests {
             Dialog::ConfirmDeleteFolder {
                 folder: "1".parse().unwrap(),
                 name: "x".into(),
-                playlist_count: 2,
-                can_delete_contents: true,
             },
             Dialog::EditPlaylist {
                 id: "pl1".into(),

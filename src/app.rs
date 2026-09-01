@@ -34,7 +34,6 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(280);
 const RESTART_BEFORE_PREVIOUS: u32 = 3_000;
 
 const TOAST_LIFETIME: Duration = Duration::from_millis(3200);
-// Shown whenever placing a just-created playlist into a folder fails.
 const CREATED_AT_ROOT: &str = "Spotify created the playlist at the root.";
 const OPTIMISTIC_HOLD: Duration = Duration::from_millis(2500);
 
@@ -347,6 +346,7 @@ pub struct App {
     pub winamp: crate::winamp::WinampState,
 }
 
+#[derive(Default)]
 struct PlaylistCreation {
     add_uris: Vec<String>,
     destination: Option<crate::rootlist::FolderId>,
@@ -1077,11 +1077,11 @@ impl App {
                             };
                             self.folders.finish_mutation(outcome);
                             if let Some(error) = error {
-                                if placed_playlist {
-                                    self.toast_error(format!("{CREATED_AT_ROOT} {error}"));
+                                self.toast_error(if placed_playlist {
+                                    format!("{CREATED_AT_ROOT} {error}")
                                 } else {
-                                    self.toast_error(error);
-                                }
+                                    error
+                                });
                             }
                         }
                     }
@@ -2191,10 +2191,8 @@ impl App {
         if self.folders.needs_initial_load() {
             self.refresh_folders();
         }
-        // The cache only bridges the wait for the session. Once folder access
-        // is known to be unavailable, showing cached folders would present a
-        // hierarchy the user cannot touch, so it goes and playlists fall back
-        // to the flat shelf.
+        // Cached folders only bridge the wait for the session; once access is
+        // known to be unavailable they would be untouchable, so they go.
         if matches!(self.folder_access(), FolderAccess::Unavailable)
             && self.folders.drop_cache()
             && let Some(account_id) = self.user_id()
@@ -2206,19 +2204,17 @@ impl App {
     }
 
     fn change_folders(&mut self, intent: crate::rootlist::Intent) -> Result<(), String> {
-        let Some(account_id) = self.user_id().map(str::to_string) else {
-            return Err("Playlist folders are unavailable".into());
-        };
-        if !self.folders_writable() {
-            return Err("Playlist folders are unavailable".into());
-        }
-        let plan = match self
+        let account_id = self
+            .user_id()
+            .filter(|_| self.folders_writable())
+            .map(str::to_string)
+            .ok_or("Playlist folders are unavailable")?;
+        let Some(plan) = self
             .folders
             .plan(intent)
             .map_err(|error| error.to_string())?
-        {
-            Some(plan) => plan,
-            None => return Ok(()),
+        else {
+            return Ok(());
         };
         let mutation = self
             .folders
@@ -3365,13 +3361,7 @@ impl App {
             }
             ApiResponse::PlaylistCreated(result) => {
                 self.playlist_busy = false;
-                let creation = self
-                    .pending_playlist_creation
-                    .take()
-                    .unwrap_or(PlaylistCreation {
-                        add_uris: Vec::new(),
-                        destination: None,
-                    });
+                let creation = self.pending_playlist_creation.take().unwrap_or_default();
                 match result {
                     Ok(playlist) => {
                         self.toast(format!("Created {}", playlist.name));
@@ -3390,7 +3380,7 @@ impl App {
                             });
                         }
                         match creation.destination {
-                            Some(parent) if self.folders_writable() => {
+                            Some(parent) => {
                                 if let Err(error) = self.change_folders(
                                     crate::rootlist::Intent::PlaceCreatedPlaylist {
                                         uri: playlist.uri.clone(),
@@ -3400,12 +3390,6 @@ impl App {
                                     self.toast_error(format!("{CREATED_AT_ROOT} {error}"));
                                     self.refresh_folders();
                                 }
-                            }
-                            Some(_) => {
-                                self.toast_error(format!(
-                                    "{CREATED_AT_ROOT} Folders became unavailable."
-                                ));
-                                self.refresh_folders();
                             }
                             None => self.refresh_folders(),
                         }
