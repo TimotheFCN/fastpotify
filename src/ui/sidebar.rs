@@ -342,6 +342,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
             );
             if app.folders_writable() {
                 egui::Popup::menu(&create)
+                    .width(220.0)
                     .frame(super::widgets::menu_frame(&palette))
                     .align(egui::RectAlign::BOTTOM_END)
                     .show(|ui| {
