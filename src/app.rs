@@ -261,6 +261,9 @@ pub struct App {
     session_window_pos: Option<[f32; 2]>,
     /// Last observed window geometry, updated each frame for saving.
     last_window_size: Option<[f32; 2]>,
+    /// Where the open dialog drew itself, so its own layout can be held
+    /// to the window it has to fit inside.
+    pub dialog_rect: Option<egui::Rect>,
     last_window_pos: Option<[f32; 2]>,
     /// Where the MilkDrop window last was, as it reported, for restoring it.
     pub milkdrop_pos: Option<[f32; 2]>,
@@ -511,6 +514,7 @@ impl App {
             session_window_size: session.window_size,
             session_window_pos: session.window_pos,
             last_window_size: None,
+            dialog_rect: None,
             last_window_pos: None,
             milkdrop_pos: session.milkdrop_pos,
             #[cfg(feature = "milkdrop")]
@@ -1730,19 +1734,13 @@ impl App {
         let scale = self.settings.milkdrop_scale.max(1);
         // The playing song, for the window to overlay when it changes.
         let song = self.now_playing().filter(|now| !now.resuming).map(|now| {
-            let mut lines = vec![now.title.clone()];
-            let mut second = now.subtitle.clone();
-            if !now.album_name.is_empty() {
-                second = if second.is_empty() {
-                    now.album_name.clone()
-                } else {
-                    format!("{second} \u{2014} {}", now.album_name)
-                };
-            }
-            if !second.is_empty() {
-                lines.push(second);
-            }
-            lines
+            // The title, the artist, the album: what the window shows in
+            // the middle of the picture when the song turns over.
+            vec![
+                now.title.clone(),
+                now.subtitle.clone(),
+                now.album_name.clone(),
+            ]
         });
         if self.milkdrop_host.is_none() {
             let tap = std::sync::Arc::clone(&self.winamp.tap);
@@ -1774,10 +1772,50 @@ impl App {
         if let Some(pos) = poll.pos {
             self.milkdrop_pos = Some(pos);
         }
+        for command in poll.commands {
+            self.milkdrop_command(&command);
+        }
+        if let Some(hz) = poll.screen_hz {
+            self.learn_screen_hz(hz);
+        }
         // Look in on the child now and then, so its close or move is noticed
         // while the app is otherwise idle.
         if self.settings.milkdrop_open {
             ctx.request_repaint_after(std::time::Duration::from_millis(300));
+        }
+    }
+
+    /// What the screen the MilkDrop window opened on refreshes at. The
+    /// first time one says, the frame rate takes its word for it: a 120
+    /// hertz screen is smooth from the start without anyone being asked.
+    /// After that the number is the listener's, and stays where it is.
+    #[cfg(feature = "milkdrop")]
+    fn learn_screen_hz(&mut self, hz: u32) {
+        if hz == 0 || self.settings.milkdrop_screen_hz == hz {
+            return;
+        }
+        let first = self.settings.milkdrop_screen_hz == 0
+            && self.settings.milkdrop_fps == crate::milkdrop::DEFAULT_FPS;
+        self.settings.milkdrop_screen_hz = hz;
+        if first {
+            self.settings.milkdrop_fps = hz;
+        }
+        self.mark_settings_dirty();
+    }
+
+    /// What the MilkDrop window's playback keys asked for. They are
+    /// MilkDrop's own keys, and the player lives over here.
+    #[cfg(feature = "milkdrop")]
+    fn milkdrop_command(&mut self, command: &str) {
+        match command {
+            "previous" => self.actions.push(Action::Previous),
+            "next" => self.actions.push(Action::Next),
+            "play-pause" => self.actions.push(Action::TogglePlay),
+            "mute" => self.actions.push(Action::ToggleMute),
+            "shuffle" => self.actions.push(Action::ToggleShuffle),
+            "volume-up" => self.actions.push(Action::VolumeBy(5)),
+            "volume-down" => self.actions.push(Action::VolumeBy(-5)),
+            _ => {}
         }
     }
 
@@ -5153,7 +5191,14 @@ impl App {
                 self.settings_dirty = true;
             }
             Action::SetMilkdropFps(fps) => {
-                self.settings.milkdrop_fps = fps.min(240);
+                self.settings.milkdrop_fps = if fps == 0 {
+                    0
+                } else {
+                    fps.clamp(
+                        *crate::milkdrop::FPS_RANGE.start(),
+                        *crate::milkdrop::FPS_RANGE.end(),
+                    )
+                };
                 self.settings_dirty = true;
             }
             Action::SetMilkdropScale(scale) => {
@@ -6720,6 +6765,73 @@ mod tests {
             Some("spotify:station:track:xyz"),
             "the station is what the interface calls playing"
         );
+    }
+
+    /// The MilkDrop window's playback keys reach the player, and they are
+    /// the app's own keys, so one pair of hands knows both.
+    #[cfg(feature = "milkdrop")]
+    #[test]
+    fn the_milkdrop_window_drives_playback() {
+        let mut app = headless_app();
+        app.local.track = Some(crate::player::LocalTrack {
+            uri: "spotify:track:a".into(),
+            ..Default::default()
+        });
+        app.local.playback = Playback::Playing;
+
+        for command in [
+            "play-pause",
+            "next",
+            "previous",
+            "mute",
+            "shuffle",
+            "volume-up",
+            "volume-down",
+        ] {
+            app.actions.clear();
+            app.milkdrop_command(command);
+            assert_eq!(
+                app.actions.len(),
+                1,
+                "{command} asks the player for one thing"
+            );
+        }
+
+        app.actions.clear();
+        app.milkdrop_command("next");
+        assert!(matches!(app.actions.first(), Some(Action::Next)));
+        app.actions.clear();
+        app.milkdrop_command("volume-down");
+        assert!(matches!(app.actions.first(), Some(Action::VolumeBy(-5))));
+
+        // A word this window never sends asks for nothing at all.
+        app.actions.clear();
+        app.milkdrop_command("teleport");
+        assert!(app.actions.is_empty());
+    }
+
+    /// The window says what its screen refreshes at, and the frame rate
+    /// takes that for its own the first time it hears it. After that the
+    /// number belongs to the listener and stays where they put it.
+    #[cfg(feature = "milkdrop")]
+    #[test]
+    fn the_frame_rate_matches_the_screen_the_first_time_it_is_known() {
+        let mut app = headless_app();
+        assert_eq!(app.settings.milkdrop_screen_hz, 0, "no screen has spoken");
+        assert_eq!(app.settings.milkdrop_fps, crate::milkdrop::DEFAULT_FPS);
+
+        app.learn_screen_hz(144);
+        assert_eq!(app.settings.milkdrop_screen_hz, 144);
+        assert_eq!(app.settings.milkdrop_fps, 144, "smooth without being asked");
+
+        // A number the listener chose is not overruled by another screen.
+        app.settings.milkdrop_fps = 30;
+        app.learn_screen_hz(60);
+        assert_eq!(
+            app.settings.milkdrop_screen_hz, 60,
+            "the new screen is noted"
+        );
+        assert_eq!(app.settings.milkdrop_fps, 30, "their number stands");
     }
 
     fn headless_app() -> App {

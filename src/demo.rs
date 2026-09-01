@@ -946,6 +946,142 @@ mod tests {
         app.backend.shutdown();
     }
 
+    /// The shortcuts are longer than a small window is tall, so the
+    /// dialog scrolls them rather than running off the bottom with the
+    /// Done button somewhere past the edge of the screen.
+    #[test]
+    fn the_shortcuts_dialog_fits_a_small_window() {
+        let root =
+            std::env::temp_dir().join(format!("fastpotify-shortcuts-test-{}", std::process::id()));
+        let dirs = AppDirs {
+            config: root.join("config"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+        };
+        let ctx = egui::Context::default();
+        let waker = crate::backend::Waker::default();
+        waker.attach(&ctx);
+        let mut app = App::new(
+            &waker,
+            dirs,
+            Settings::default(),
+            AppOptions {
+                media_controls: false,
+                tray: false,
+            },
+        );
+        app.attach(&ctx);
+        populate(&mut app);
+        app.dialog = Some(Dialog::Shortcuts);
+
+        let height = 420.0;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, height),
+            )),
+            ..Default::default()
+        };
+        // Two frames: the dialog sizes itself on the first.
+        let mut first = ctx.run_ui(input.clone(), |ui| app.frame_ui(ui));
+        first.textures_delta.clear();
+        let mut output = ctx.run_ui(input, |ui| app.frame_ui(ui));
+        output.textures_delta.clear();
+
+        let dialog = app.dialog_rect.expect("the dialog drew itself");
+        let bottom = dialog.max.y;
+        assert!(
+            bottom <= height + 1.0,
+            "the dialog runs {} pixels past the bottom of a {height}-tall window",
+            bottom - height
+        );
+        app.backend.shutdown();
+    }
+
+    /// The frame rate is a dial with detents: it stops at the rates
+    /// worth having, names the one it is on, and moving it one notch
+    /// lands on the next of them rather than somewhere in between.
+    #[cfg(feature = "milkdrop")]
+    #[test]
+    fn the_frame_rate_dial_steps_between_its_stops() {
+        let root =
+            std::env::temp_dir().join(format!("fastpotify-fps-dial-test-{}", std::process::id()));
+        let dirs = AppDirs {
+            config: root.join("config"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+        };
+        let ctx = egui::Context::default();
+        let waker = crate::backend::Waker::default();
+        waker.attach(&ctx);
+        let mut app = App::new(
+            &waker,
+            dirs,
+            Settings::default(),
+            AppOptions {
+                media_controls: false,
+                tray: false,
+            },
+        );
+        app.attach(&ctx);
+        populate(&mut app);
+        app.settings.milkdrop_screen_hz = 144;
+        app.settings.milkdrop_fps = 60;
+        app.open(Page::Settings);
+
+        // What the dial says, drawn on the real Settings page.
+        let drawn = |app: &mut App, ctx: &egui::Context| -> Vec<String> {
+            let input = egui::RawInput {
+                // Tall enough that the whole of Settings is drawn,
+                // MilkDrop's own section included.
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1280.0, 4000.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| app.frame_ui(ui));
+            output.textures_delta.clear();
+            let mut said = Vec::new();
+            fn walk(shape: &egui::epaint::Shape, said: &mut Vec<String>) {
+                match shape {
+                    egui::epaint::Shape::Text(text) => said.push(text.galley.job.text.clone()),
+                    egui::epaint::Shape::Vec(shapes) => {
+                        shapes.iter().for_each(|shape| walk(shape, said))
+                    }
+                    _ => {}
+                }
+            }
+            for clipped in &output.shapes {
+                walk(&clipped.shape, &mut said);
+            }
+            said
+        };
+
+        for _ in 0..3 {
+            let said = drawn(&mut app, &ctx);
+            assert!(
+                said.iter().any(|text| text.contains("60 fps")),
+                "the dial names the rate it is on: {said:?}"
+            );
+        }
+
+        // Every stop can be reached, and each names itself.
+        for (rate, expected) in [
+            (144, "144 fps, your screen"),
+            (0, "Uncapped"),
+            (30, "30 fps"),
+        ] {
+            app.settings.milkdrop_fps = rate;
+            let said = drawn(&mut app, &ctx);
+            assert!(
+                said.iter().any(|text| text == expected),
+                "the dial on {rate} should read {expected}: {said:?}"
+            );
+        }
+        app.backend.shutdown();
+    }
+
     /// Every page, panel, and dialog lays out without panicking.
     #[test]
     fn every_surface_renders_headless() {

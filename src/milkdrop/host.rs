@@ -27,6 +27,9 @@ struct Reported {
     closed: bool,
     pos: Option<[f32; 2]>,
     size: Option<[f32; 2]>,
+    /// What the window's keys asked of the player, oldest first.
+    commands: Vec<String>,
+    screen_hz: Option<u32>,
 }
 
 /// One line of what the child says on its stdout.
@@ -35,6 +38,8 @@ struct Event {
     closed: Option<bool>,
     pos: Option<[f32; 2]>,
     size: Option<[f32; 2]>,
+    command: Option<String>,
+    screen_hz: Option<u32>,
 }
 
 /// What the app takes from the window each frame.
@@ -43,6 +48,10 @@ pub struct Poll {
     pub closed: bool,
     pub pos: Option<[f32; 2]>,
     pub size: Option<[f32; 2]>,
+    /// What its keys asked of the player since the last look.
+    pub commands: Vec<String>,
+    /// How often the screen it is on refreshes, when it has said.
+    pub screen_hz: Option<u32>,
 }
 
 struct Running {
@@ -204,22 +213,32 @@ impl Host {
                 closed: false,
                 pos: None,
                 size: None,
+                commands: Vec::new(),
+                screen_hz: None,
             };
         };
         // The child exiting is a close, even if it said nothing.
         let exited = matches!(running.process.try_wait(), Ok(Some(_)));
-        let (closed, pos, size) = {
+        let (closed, pos, size, commands, screen_hz) = {
             let mut reported = running.reported.lock().unwrap_or_else(|p| p.into_inner());
             (
                 reported.closed || exited,
                 reported.pos.take(),
                 reported.size.take(),
+                std::mem::take(&mut reported.commands),
+                reported.screen_hz.take(),
             )
         };
         if closed {
             self.stop();
         }
-        Poll { closed, pos, size }
+        Poll {
+            closed,
+            pos,
+            size,
+            commands,
+            screen_hz,
+        }
     }
 
     /// Closes the window and reaps the child.
@@ -277,6 +296,16 @@ fn spawn_reader(stdout: std::process::ChildStdout, reported: Arc<Mutex<Reported>
                 }
                 if event.size.is_some() {
                     reported.size = event.size;
+                }
+                if event.screen_hz.is_some() {
+                    reported.screen_hz = event.screen_hz;
+                }
+                if let Some(command) = event.command {
+                    // A key held down cannot pile up more than a moment's
+                    // worth before the app takes them.
+                    if reported.commands.len() < 64 {
+                        reported.commands.push(command);
+                    }
                 }
             }
             // Stdout closed: the child is gone.

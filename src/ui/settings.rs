@@ -615,7 +615,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "MilkDrop window",
-            "The classic Winamp visualiser, drawn by projectM in a window of its own. Open it here, with the vis button in the top bar, with Ctrl+Shift+K, or with the V on the mini player. Press ? inside it to see the keys. It draws the music played on this computer.",
+            "The classic Winamp visualiser, drawn by projectM in a window of its own. Open it here, with the vis button in the top bar, with Ctrl+Shift+K, or with the V on the mini player. Its keys are MilkDrop's own; press ? or F1 inside it to see them. It draws the music played on this computer.",
             |ui| {
                 let mut open = app.settings.milkdrop_open;
                 if widgets::switch(ui, &palette, &mut open).changed() {
@@ -681,28 +681,65 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 }
             },
         );
+        let screen_hz = app.settings.milkdrop_screen_hz;
         widgets::setting_row(
             ui,
             &palette,
             "Frame rate",
-            "How often the window draws. Matching your screen is smooth without wasting frames; uncapped runs as fast as it can.",
+            &match screen_hz {
+                0 => "How often the window draws. Fewer frames leave more of the machine for everything else; uncapped draws as fast as it can.".to_string(),
+                hz => format!(
+                    "How often the window draws. Your screen refreshes {hz} times a second, and drawing more often than that shows nobody anything; uncapped draws as fast as it can."
+                ),
+            },
             |ui| {
-                let current = app.settings.milkdrop_fps;
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    for fps in crate::milkdrop::FPS_CHOICES {
-                        let label = if fps == 0 {
-                            "Uncapped".to_string()
-                        } else {
-                            format!("{fps} fps")
-                        };
-                        if theme::soft_button(ui, &palette, None, &label, fps == current).clicked()
-                            && fps != current
-                        {
-                            app.actions.push(Action::SetMilkdropFps(fps));
+                let fps = app.settings.milkdrop_fps;
+                // The dial stops at the rates worth having and passes
+                // through nothing in between, the way a gear lever does.
+                let stops = crate::milkdrop::fps_stops(screen_hz, fps);
+                let last = stops.len().saturating_sub(1);
+                let mut at = stops.iter().position(|rate| *rate == fps).unwrap_or(1);
+                let labels: Vec<String> = stops
+                    .iter()
+                    .map(|rate| crate::milkdrop::fps_label(*rate, screen_hz))
+                    .collect();
+                let shown = labels.clone();
+                let typed = stops.clone();
+                let slider = egui::Slider::new(&mut at, 0..=last)
+                    .step_by(1.0)
+                    .custom_formatter(move |value, _| {
+                        shown
+                            .get((value.round().max(0.0) as usize).min(shown.len() - 1))
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                    .custom_parser(move |text| {
+                        // A rate typed in lands on the nearest stop, since
+                        // the stops are all this dial can hold.
+                        let text = text.trim().to_lowercase();
+                        if text.starts_with("un") {
+                            return Some(typed.len().saturating_sub(1) as f64);
                         }
-                    }
-                });
+                        let wanted: u32 = text
+                            .trim_end_matches("fps")
+                            .trim()
+                            .split(',')
+                            .next()?
+                            .trim()
+                            .parse()
+                            .ok()?;
+                        typed
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, rate)| **rate > 0)
+                            .min_by_key(|(_, rate)| rate.abs_diff(wanted))
+                            .map(|(index, _)| index as f64)
+                    });
+                if ui.add(slider).changed()
+                    && let Some(rate) = stops.get(at)
+                {
+                    app.actions.push(Action::SetMilkdropFps(*rate));
+                }
             },
         );
         widgets::setting_row(
