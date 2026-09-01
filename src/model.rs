@@ -1,9 +1,12 @@
 //! Interface-side state: what is open, what is loaded, what was asked for.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::api::models::*;
+
+pub const STALE_ANSWER_RECHECK: Duration = Duration::from_millis(700);
+pub const STALE_ANSWER_RETRIES: u8 = 6;
 
 /// Every screen the central panel can show.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -264,6 +267,7 @@ impl<T> CursorList<T> {
 #[derive(Default)]
 pub struct Library {
     pub playlists: Loadable<Vec<Playlist>>,
+    pub playlists_loading: bool,
     pub playlists_next: Option<u32>,
     pub liked: PagedList<SavedTrack>,
     pub albums: PagedList<SavedAlbum>,
@@ -472,6 +476,7 @@ pub struct DragTrack {
 #[derive(Clone, Debug)]
 pub struct DragEntry {
     pub uri: String,
+    pub folder: Option<crate::rootlist::FolderId>,
     pub title: String,
     pub image: Option<String>,
 }
@@ -482,6 +487,23 @@ pub enum Dialog {
         name: String,
         public: bool,
         add_uris: Vec<String>,
+        destination: Option<crate::rootlist::FolderId>,
+    },
+    EditFolder {
+        folder: Option<crate::rootlist::FolderId>,
+        parent: Option<crate::rootlist::FolderId>,
+        name: String,
+    },
+    MoveToFolder {
+        node: crate::rootlist::Node,
+        current: Option<crate::rootlist::FolderId>,
+        query: String,
+    },
+    ConfirmDeleteFolder {
+        folder: crate::rootlist::FolderId,
+        name: String,
+        playlist_count: usize,
+        can_delete_contents: bool,
     },
     EditPlaylist {
         id: String,
@@ -576,6 +598,7 @@ pub enum Action {
         name: String,
         public: bool,
         add_uris: Vec<String>,
+        destination: Option<crate::rootlist::FolderId>,
     },
     UpdatePlaylist {
         id: String,
@@ -584,6 +607,9 @@ pub enum Action {
         public: bool,
     },
     DeletePlaylist(String),
+    ToggleFolder(crate::rootlist::FolderId),
+    ChangeFolders(crate::rootlist::Intent),
+    RefreshFolders,
     Transfer(String),
     /// Hand the account to a receiver found on the local network.
     ActivateReceiver(Box<crate::zeroconf::Receiver>),

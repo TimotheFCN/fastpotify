@@ -46,15 +46,28 @@ context menu, drag a row into the block to pin it where you drop it,
 drag within the block to reorder it, and drag a pinned row below the
 block to unpin it.
 
-Below the pins, the sidebar starts out sorting playlists by when you
-last played them. Drag one to a new place and the rest of the shelf
-switches to your own order instead: rows stay exactly where you drop
-them, and new playlists wait just under the pins until you place them.
-Choose **Sort by recently played** from any playlist's context menu to
-go back; dragging a row switches to your own order again.
+Below the pins, the Playlists shelf follows Spotify's folder hierarchy and
+order. The **+** button can create a playlist or folder. Folder and playlist
+menus can move an item to another folder, and dragging moves it before a
+sibling, into a folder, or back to the root. These changes appear in Spotify's
+other clients. A pinned playlist remains a shortcut at the top; dragging that
+shortcut changes the pin and does not move the playlist itself.
 
-The Albums, Artists, and Podcasts shelves pin the same way: drag into
-the block, within it, or below it.
+Folders start collapsed. Fastpotify remembers which folders you open and
+restores them after an app restart. New folders also start collapsed.
+
+Folder access needs the live playback session and Web API sign-in to belong to
+the same account. A personal Web API app does not replace playback
+authorization. Full sign-out removes that authorization, so use **Enable
+playback** beside **Folders unavailable** after signing in again. While playback
+is starting or disconnected, the last loaded hierarchy remains visible but
+read-only. If no hierarchy has loaded yet, the shelf returns to its flat
+playlist list and its previous local order. Filtering also shows flat results
+and disables folder reordering because hidden siblings would make a drop
+ambiguous.
+
+The Albums, Artists, and Podcasts shelves pin the same way: drag into the
+block, within it, or below it.
 
 Use the chips to filter the sidebar by Playlists, Albums, Artists, or Podcasts,
 or use the magnifier to search it. Liked Songs stays at the top. The current

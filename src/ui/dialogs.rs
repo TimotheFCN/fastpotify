@@ -29,6 +29,27 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
             ui.set_width(420.0);
             match dialog {
                 Dialog::CreatePlaylist { .. } => create_playlist(app, ui),
+                Dialog::EditFolder { .. } => edit_folder(app, ui),
+                Dialog::MoveToFolder {
+                    node,
+                    current,
+                    query,
+                } => {
+                    move_to_folder(app, ui, &node, current, query)
+                }
+                Dialog::ConfirmDeleteFolder {
+                    folder,
+                    name,
+                    playlist_count,
+                    can_delete_contents,
+                } => delete_folder(
+                    app,
+                    ui,
+                    folder,
+                    &name,
+                    playlist_count,
+                    can_delete_contents,
+                ),
                 Dialog::EditPlaylist { .. } => edit_playlist(app, ui),
                 Dialog::ConfirmDeletePlaylist { id, name, owned } => {
                     theme::text(ui, if owned { "Delete playlist?" } else { "Remove from Your Library?" }, theme::bold(20.0), palette.text);
@@ -40,7 +61,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                     };
                     ui.add(egui::Label::new(egui::RichText::new(body).font(theme::regular(14.0)).color(palette.secondary)).wrap());
                     ui.add_space(20.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    dialog_footer(ui, |ui| {
                         if theme::pill_button(ui, &palette, if owned { "Delete" } else { "Remove" }, true).clicked() {
                             app.actions.push(Action::DeletePlaylist(id.clone()));
                         }
@@ -74,7 +95,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                             }
                         });
                     ui.add_space(16.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    dialog_footer(ui, |ui| {
                         if theme::pill_button(ui, &palette, "Done", true).clicked() {
                             app.actions.push(Action::CloseDialog);
                         }
@@ -102,7 +123,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                         .wrap(),
                     );
                     ui.add_space(20.0);
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    dialog_footer(ui, |ui| {
                         if theme::pill_button(ui, &palette, "OK", true).clicked() {
                             app.actions.push(Action::CloseDialog);
                         }
@@ -113,6 +134,360 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     if response.should_close() {
         app.actions.push(Action::CloseDialog);
     }
+}
+
+fn dialog_footer(ui: &mut egui::Ui, content: impl FnOnce(&mut egui::Ui)) {
+    ui.horizontal(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), content);
+    });
+}
+
+fn edit_folder(app: &mut App, ui: &mut egui::Ui) {
+    let palette = app.palette;
+    let Some(Dialog::EditFolder {
+        folder,
+        parent,
+        name,
+    }) = &mut app.dialog
+    else {
+        return;
+    };
+    theme::text(
+        ui,
+        if folder.is_some() {
+            "Rename folder"
+        } else {
+            "New folder"
+        },
+        theme::bold(20.0),
+        palette.text,
+    );
+    ui.add_space(12.0);
+    theme::text(ui, "Name", theme::medium(13.0), palette.secondary);
+    let field = text_field(ui, &palette, "folder-name", name, "Folder name", true);
+    ui.add_space(20.0);
+    let submit = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+    let name = name.trim().to_string();
+    let folder = *folder;
+    let parent = *parent;
+    dialog_footer(ui, |ui| {
+        let label = if folder.is_some() { "Rename" } else { "Create" };
+        if (theme::pill_button(ui, &palette, label, true).clicked() || submit) && !name.is_empty() {
+            let intent = match folder {
+                Some(folder) => crate::rootlist::Intent::RenameFolder {
+                    folder,
+                    name: name.clone(),
+                },
+                None => crate::rootlist::Intent::create_folder(parent, name.clone()),
+            };
+            app.actions.push(Action::ChangeFolders(intent));
+            app.actions.push(Action::CloseDialog);
+        }
+        if theme::pill_button(ui, &palette, "Cancel", false).clicked() {
+            app.actions.push(Action::CloseDialog);
+        }
+    });
+}
+
+fn move_to_folder(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    node: &crate::rootlist::Node,
+    current: Option<crate::rootlist::FolderId>,
+    mut query: String,
+) {
+    let palette = app.palette;
+    theme::text(ui, "Move to folder", theme::bold(20.0), palette.text);
+    ui.add_space(12.0);
+    let folders = app
+        .folders
+        .confirmed_snapshot()
+        .and_then(|snapshot| snapshot.valid_folder_destinations(node).ok())
+        .unwrap_or_default();
+    if folders.len() > 6 || !query.is_empty() {
+        super::widgets::search_field(
+            ui,
+            &palette,
+            egui::Id::new("folder-destination-search"),
+            &mut query,
+            "Find a folder",
+            ui.available_width(),
+        );
+        ui.add_space(10.0);
+    }
+    let needle = query.trim().to_lowercase();
+    let visible = visible_folder_destinations(&folders, &needle);
+    let mut choice = None;
+    egui::ScrollArea::vertical()
+        .max_height(320.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            if folder_destination_row(
+                ui,
+                &palette,
+                crate::theme::Icon::House,
+                "Root",
+                0,
+                current.is_none(),
+            )
+            .clicked()
+            {
+                choice = Some(None);
+            }
+            for folder in folders.iter().filter(|folder| visible.contains(&folder.id)) {
+                let name = if folder.name.is_empty() {
+                    "Folder"
+                } else {
+                    folder.name.as_str()
+                };
+                if folder_destination_row(
+                    ui,
+                    &palette,
+                    crate::theme::Icon::Library,
+                    name,
+                    folder.depth.saturating_add(1),
+                    current == Some(folder.id),
+                )
+                .clicked()
+                {
+                    choice = Some(Some(folder.id));
+                }
+            }
+            if visible.is_empty() {
+                ui.add_space(12.0);
+                theme::subtle(ui, &palette, "No folders found.");
+                ui.add_space(12.0);
+            }
+        });
+    if let Some(parent) = choice {
+        app.actions
+            .push(Action::ChangeFolders(crate::rootlist::Intent::Move {
+                node: node.clone(),
+                parent,
+                before: None,
+            }));
+        app.actions.push(Action::CloseDialog);
+    }
+    if let Some(Dialog::MoveToFolder { query: held, .. }) = &mut app.dialog {
+        *held = query;
+    }
+    ui.add_space(16.0);
+    dialog_footer(ui, |ui| {
+        if theme::pill_button(ui, &palette, "Cancel", false).clicked() {
+            app.actions.push(Action::CloseDialog);
+        }
+    });
+}
+
+fn visible_folder_destinations(
+    folders: &[crate::rootlist::Folder],
+    needle: &str,
+) -> std::collections::HashSet<crate::rootlist::FolderId> {
+    if needle.is_empty() {
+        return folders.iter().map(|folder| folder.id).collect();
+    }
+    let parents = folders
+        .iter()
+        .map(|folder| (folder.id, folder.parent))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut visible = std::collections::HashSet::new();
+    for folder in folders
+        .iter()
+        .filter(|folder| folder.name.to_lowercase().contains(needle))
+    {
+        let mut id = Some(folder.id);
+        while let Some(folder) = id {
+            if !visible.insert(folder) {
+                break;
+            }
+            id = parents.get(&folder).copied().flatten();
+        }
+    }
+    visible
+}
+
+fn folder_destination_row(
+    ui: &mut egui::Ui,
+    palette: &theme::Palette,
+    icon: crate::theme::Icon,
+    name: &str,
+    depth: u8,
+    current: bool,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), 38.0),
+        if current {
+            egui::Sense::hover()
+        } else {
+            egui::Sense::click()
+        },
+    );
+    if ui.is_rect_visible(rect) {
+        let fill = if current {
+            palette.accent.gamma_multiply(0.12)
+        } else if response.hovered() {
+            palette.surface_hover
+        } else {
+            egui::Color32::TRANSPARENT
+        };
+        ui.painter().rect_filled(rect, CornerRadius::same(6), fill);
+        if current {
+            ui.painter().rect_stroke(
+                rect,
+                CornerRadius::same(6),
+                Stroke::new(1.0, palette.accent.gamma_multiply(0.7)),
+                egui::StrokeKind::Inside,
+            );
+        }
+        let depth = f32::from(depth.min(12));
+        let guide_left = rect.left() + 16.0;
+        for level in 0..depth as usize {
+            let x = guide_left + level as f32 * 18.0;
+            ui.painter()
+                .vline(x, rect.y_range(), Stroke::new(1.0, palette.outline));
+        }
+        let icon_center = egui::pos2(guide_left + depth * 18.0, rect.center().y);
+        if depth > 0.0 {
+            ui.painter().hline(
+                icon_center.x - 18.0..=icon_center.x - 9.0,
+                icon_center.y,
+                Stroke::new(1.0, palette.outline),
+            );
+        }
+        icon.image(
+            if current {
+                palette.accent
+            } else {
+                palette.secondary
+            },
+            17.0,
+        )
+        .paint_at(
+            ui,
+            egui::Rect::from_center_size(icon_center, egui::Vec2::splat(17.0)),
+        );
+        let text_left = icon_center.x + 14.0;
+        let text_right = rect.right() - if current { 36.0 } else { 12.0 };
+        let painter = ui.painter().with_clip_rect(egui::Rect::from_min_max(
+            egui::pos2(text_left, rect.top()),
+            egui::pos2(text_right, rect.bottom()),
+        ));
+        crate::bidi::paint_line(
+            &painter,
+            text_left,
+            text_right,
+            rect.center().y,
+            name,
+            theme::medium(13.5),
+            palette.text,
+        );
+        if current {
+            crate::theme::Icon::Check
+                .image(palette.accent, 16.0)
+                .paint_at(
+                    ui,
+                    egui::Rect::from_center_size(
+                        egui::pos2(rect.right() - 16.0, rect.center().y),
+                        egui::Vec2::splat(16.0),
+                    ),
+                );
+        }
+    }
+    if current {
+        response
+    } else {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    }
+}
+
+fn delete_folder(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    folder: crate::rootlist::FolderId,
+    name: &str,
+    playlist_count: usize,
+    can_delete_contents: bool,
+) {
+    let palette = app.palette;
+    theme::text(
+        ui,
+        format!("Delete \u{201c}{name}\u{201d}?"),
+        theme::bold(20.0),
+        palette.text,
+    );
+    ui.add_space(8.0);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new("Choose what happens to the playlists inside this folder.")
+                .font(theme::regular(14.0))
+                .color(palette.secondary),
+        )
+        .wrap(),
+    );
+    ui.add_space(16.0);
+    let keep = ui
+        .add_sized(
+            [ui.available_width(), 38.0],
+            egui::Button::new(
+                egui::RichText::new("Delete folder and keep playlists")
+                    .font(theme::semibold(13.0))
+                    .color(palette.text),
+            )
+            .fill(palette.surface)
+            .stroke(Stroke::new(1.0, palette.outline))
+            .corner_radius(CornerRadius::same(8)),
+        )
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    if keep.clicked() {
+        app.actions.push(Action::ChangeFolders(
+            crate::rootlist::Intent::DeleteFolder {
+                folder,
+                contents: false,
+            },
+        ));
+        app.actions.push(Action::CloseDialog);
+    }
+    if can_delete_contents {
+        ui.add_space(12.0);
+        theme::text(
+            ui,
+            format!(
+                "This also removes {playlist_count} playlist{} from Your Library.",
+                if playlist_count == 1 { "" } else { "s" }
+            ),
+            theme::regular(12.5),
+            palette.danger,
+        );
+        ui.add_space(6.0);
+        let delete = ui
+            .add_sized(
+                [ui.available_width(), 38.0],
+                egui::Button::new(
+                    egui::RichText::new("Delete folder and contents")
+                        .font(theme::semibold(13.0))
+                        .color(palette.danger),
+                )
+                .fill(palette.danger.gamma_multiply(0.08))
+                .stroke(Stroke::new(1.0, palette.danger.gamma_multiply(0.7)))
+                .corner_radius(CornerRadius::same(8)),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        if delete.clicked() {
+            app.actions.push(Action::ChangeFolders(
+                crate::rootlist::Intent::DeleteFolder {
+                    folder,
+                    contents: true,
+                },
+            ));
+            app.actions.push(Action::CloseDialog);
+        }
+    }
+    ui.add_space(16.0);
+    dialog_footer(ui, |ui| {
+        if theme::pill_button(ui, &palette, "Cancel", false).clicked() {
+            app.actions.push(Action::CloseDialog);
+        }
+    });
 }
 
 fn text_field(
@@ -151,6 +526,7 @@ fn create_playlist(app: &mut App, ui: &mut egui::Ui) {
         name,
         public,
         add_uris,
+        destination,
     }) = &mut app.dialog
     else {
         return;
@@ -182,7 +558,8 @@ fn create_playlist(app: &mut App, ui: &mut egui::Ui) {
     let name_value = name.trim().to_string();
     let public_value = *public;
     let uris = add_uris.clone();
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+    let destination = *destination;
+    dialog_footer(ui, |ui| {
         if busy {
             theme::spinner(ui, 18.0, palette.accent);
         } else {
@@ -192,6 +569,7 @@ fn create_playlist(app: &mut App, ui: &mut egui::Ui) {
                     name: name_value.clone(),
                     public: public_value,
                     add_uris: uris.clone(),
+                    destination,
                 });
             }
             if theme::pill_button(ui, &palette, "Cancel", false).clicked() {
@@ -246,7 +624,7 @@ fn edit_playlist(app: &mut App, ui: &mut egui::Ui) {
     let name_value = name.trim().to_string();
     let description_value = description.trim().to_string();
     let public_value = *public;
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+    dialog_footer(ui, |ui| {
         if busy {
             theme::spinner(ui, 18.0, palette.accent);
         } else {
@@ -263,4 +641,36 @@ fn edit_playlist(app: &mut App, ui: &mut egui::Ui) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_search_keeps_matching_paths_visible() {
+        let parent = crate::rootlist::Folder {
+            id: "1".parse().unwrap(),
+            name: "Work".into(),
+            depth: 0,
+            parent: None,
+        };
+        let child = crate::rootlist::Folder {
+            id: "2".parse().unwrap(),
+            name: "Research".into(),
+            depth: 1,
+            parent: Some(parent.id),
+        };
+        let other = crate::rootlist::Folder {
+            id: "3".parse().unwrap(),
+            name: "Weekend".into(),
+            depth: 0,
+            parent: None,
+        };
+
+        let visible =
+            visible_folder_destinations(&[parent.clone(), child.clone(), other], "search");
+
+        assert_eq!(visible, [parent.id, child.id].into_iter().collect());
+    }
 }

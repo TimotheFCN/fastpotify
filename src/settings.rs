@@ -91,8 +91,8 @@ pub struct Settings {
     pub check_for_updates: bool,
     /// Context URIs pinned to the top of the sidebar, in pin order.
     pub pinned_contexts: Vec<String>,
-    /// The sidebar's own playlist order, set by dragging rows. Empty means
-    /// the automatic order: the pinned block first, then recently played.
+    /// The flat playlist order used when Spotify folders are unavailable.
+    /// Empty means the pinned block first, then recently played.
     pub sidebar_order: Vec<String>,
     /// Interface zoom, egui's zoom factor; Ctrl+plus/minus changes it.
     pub zoom: f32,
@@ -373,8 +373,14 @@ pub struct SessionState {
     /// are queued again from `last_added_queue` when the remembered song
     /// resumes, and the rest belongs to the context that keeps playing.
     pub last_queue_rows: Vec<crate::api::models::PlayableItem>,
-    /// Sidebar folders rolled up, by their rootlist ids.
+    /// Legacy folder state, kept so sessions written before expanded folders
+    /// were recorded can be migrated after the rootlist loads.
     pub collapsed_folders: Vec<String>,
+    /// Sidebar folders left open, by their rootlist ids. `None` identifies a
+    /// legacy session; an empty list means every folder is collapsed.
+    pub expanded_folders: Option<Vec<String>>,
+    /// Account whose folder ids `expanded_folders` belong to.
+    pub folder_account_id: Option<String>,
     /// Whether the listener had shuffle on, a mode that outlives contexts.
     pub shuffle_on: bool,
     /// Each table's chosen sort, by encoded page, restored at start.

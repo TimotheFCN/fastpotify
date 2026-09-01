@@ -283,6 +283,7 @@ pub fn item_menu(
                     name: String::new(),
                     public: false,
                     add_uris: vec![uri.clone()],
+                    destination: None,
                 }));
             }
             if !playlists.is_empty() {
