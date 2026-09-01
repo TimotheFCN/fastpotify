@@ -65,7 +65,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui.add_space(super::widgets::PAGE_PADDING);
             ui.spacing_mut().item_spacing.x = 8.0;
             if !app.settings.sidebar_visible {
-                if nav_button(ui, &palette, Icon::PanelLeft, true, "Show sidebar (Cmd+B)").clicked()
+                if nav_button(
+                    ui,
+                    &palette,
+                    Icon::PanelLeft,
+                    true,
+                    super::keys::platform_shortcut("Show sidebar (Ctrl+B)", "Show sidebar (Cmd+B)"),
+                )
+                .clicked()
                 {
                     app.actions.push(Action::ToggleSidebar);
                 }
@@ -242,7 +249,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                         palette.secondary
                     },
                     palette.text,
-                    "MilkDrop visualiser (Ctrl+Shift+K)",
+                    super::keys::platform_shortcut(
+                        "MilkDrop visualiser (Ctrl+Shift+K)",
+                        "MilkDrop visualiser (Cmd+Shift+K)",
+                    ),
                 )
                 .clicked()
                 {
@@ -254,7 +264,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     19.0,
                     palette.secondary,
                     palette.text,
-                    "Winamp mini player (Ctrl+M)",
+                    super::keys::platform_shortcut(
+                        "Winamp mini player (Ctrl+M)",
+                        "Winamp mini player (Cmd+Shift+M)",
+                    ),
                 )
                 .clicked()
                 {
@@ -268,7 +281,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     .busy(std::time::Duration::from_millis(1000))
                 {
                     theme::spinner(ui, 15.0, palette.secondary)
-                        .on_hover_text("Talking to Spotify…");
+                        .on_hover_text("Waiting for Spotify…");
                 }
                 // Where playback is.
                 if let Some(now) = app.now_playing()
@@ -336,7 +349,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     if response
                         .on_hover_cursor(egui::CursorIcon::PointingHand)
                         .on_hover_text(format!(
-                            "Fastpotify {} is out. Opens the download page.",
+                            "Version {} is available. Open the download page.",
                             update.version
                         ))
                         .clicked()

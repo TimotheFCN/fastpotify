@@ -303,8 +303,7 @@ pub fn populate(app: &mut App) {
                     // unit; the rest remain absolute dates.
                     added_at: Some(demo_added_at(index, demo_now)),
                     is_local: false,
-                    // A second pair of hands, so the page reads as made
-                    // together: the Added By column and the byline show.
+                    // Use multiple contributors so Added By and the byline render.
                     added_by: Some(crate::api::models::UserRef {
                         id: Some(if index % 3 == 1 { "kasia" } else { "sam" }.into()),
                     }),
@@ -444,6 +443,28 @@ pub fn populate(app: &mut App) {
             })
             .collect(),
     );
+    // Recents tab (queue sidebar) – deduped, timestamped, paginated.
+    let recents_now = Timestamp::now();
+    app.recents.items = tracks
+        .iter()
+        .skip(2)
+        .take(24)
+        .enumerate()
+        .map(|(index, track)| PlayHistory {
+            track: track.clone(),
+            played_at: Some(demo_added_at(index, recents_now)),
+            context: None,
+        })
+        .collect();
+    app.recents.loaded_once = true;
+    app.recents.loading = false;
+    app.recents.error = None;
+    // Has more to load (before cursor of oldest item).
+    let oldest = recents_now - SignedDuration::from_hours(48);
+    // Cursor is unix millis; jiff Timestamp exposes seconds + nanos.
+    let millis = oldest.as_second() * 1000 + i64::from(oldest.subsec_nanosecond() / 1_000_000);
+    app.recents.after = Some(millis.to_string());
+    app.recents.complete = false;
     app.home.top_artists = Loadable::Loaded((0..8).map(artist).collect());
     app.home.top_tracks = Loadable::Loaded(tracks.iter().skip(10).take(10).cloned().collect());
     app.home.top_songs = Loadable::Loaded(tracks.iter().skip(10).cloned().collect());
@@ -513,9 +534,7 @@ pub fn populate(app: &mut App) {
             kind: "smartphone".into(),
         },
     ];
-    // A speaker announcing itself over ZeroConf that the account has not
-    // adopted yet, so the device picker shows the row that offers to hand it
-    // the account.
+    // Include an unsigned ZeroConf receiver in the device picker.
     app.receivers = vec![crate::zeroconf::Receiver {
         name: "House Spotify".into(),
         address: std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 42)),
@@ -582,8 +601,7 @@ fn sample_lyrics() -> crate::lyrics::Lyrics {
 /// Applies `--demo-page` and `--demo-show`.
 #[cfg(feature = "demo")]
 pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
-    // Whatever the settings on this machine say, a shot is of the big
-    // window unless the mini player is asked for.
+    // Default screenshots to the main window regardless of saved settings.
     app.settings.winamp_window = false;
     if let Some(page) = page.and_then(Page::decode) {
         app.open(page);
@@ -591,6 +609,10 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
     for surface in show.unwrap_or("").split(',').map(str::trim) {
         match surface {
             "queue" => app.show_queue_panel = true,
+            "recents" => {
+                app.show_queue_panel = true;
+                app.queue_tab = QueueTab::Recents;
+            }
             "devices" => app.show_devices = true,
             "shortcuts" => app.dialog = Some(Dialog::Shortcuts),
             "premium" => app.dialog = Some(Dialog::PremiumNeeded),
@@ -624,8 +646,7 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
                 app.resume_position_ms = 19_566;
                 app.actions.push(Action::Next);
             }
-            // The built-in skin, whatever the settings say, so shots are
-            // the same everywhere and never show someone else's art.
+            // Use the built-in skin for deterministic screenshots.
             "winamp" => {
                 app.settings.winamp_window = true;
                 app.settings.skin = None;
@@ -793,9 +814,7 @@ mod tests {
         output.textures_delta.clear();
     }
 
-    /// A toast lays its words out in a line. The anchored area it lives
-    /// in starts out narrow, and a label left to wrap at the area's width
-    /// broke on every word.
+    /// A toast is wide enough to avoid wrapping every word.
     #[test]
     fn a_toast_is_wide_enough_to_read() {
         let root =
@@ -949,11 +968,10 @@ mod tests {
         app.settings.milkdrop_fps = 60;
         app.open(Page::Settings);
 
-        // What the dial says, drawn on the real Settings page.
+        // Read labels from the real Settings page.
         let drawn = |app: &mut App, ctx: &egui::Context| -> Vec<String> {
             let input = egui::RawInput {
-                // Tall enough that the whole of Settings is drawn,
-                // MilkDrop's own section included.
+                // Draw the full Settings page, including MilkDrop.
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
                     egui::vec2(1280.0, 4000.0),
@@ -999,6 +1017,84 @@ mod tests {
                 "the dial on {rate} should read {expected}: {said:?}"
             );
         }
+        app.backend.shutdown();
+    }
+
+    /// Rule: at its narrowest the queue panel still puts its header on
+    /// one line. The chips used to wrap under the buttons, and then,
+    /// once the buttons were given their room first, onto a second row,
+    /// which is a lot of panel spent on saying what two words already
+    /// said.
+    #[test]
+    fn the_narrowest_panel_keeps_its_header_on_one_row() {
+        let root = std::env::temp_dir().join(format!(
+            "fastpotify-queue-header-test-{}",
+            std::process::id()
+        ));
+        let dirs = AppDirs {
+            config: root.join("config"),
+            state: root.join("state"),
+            cache: root.join("cache"),
+        };
+        let ctx = egui::Context::default();
+        let waker = crate::backend::Waker::default();
+        waker.attach(&ctx);
+        let mut app = App::new(
+            &waker,
+            dirs,
+            Settings::default(),
+            AppOptions {
+                media_controls: false,
+                tray: false,
+            },
+        );
+        app.attach(&ctx);
+        populate(&mut app);
+        app.show_queue_panel = true;
+        app.settings.queue_width = crate::theme::SIDE_PANEL_MIN_WIDTH;
+
+        // Where each piece of text was actually drawn.
+        let mut placed: Vec<(String, f32)> = Vec::new();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        // The panel applies its width after the first frame.
+        for _ in 0..2 {
+            placed.clear();
+            let mut output = ctx.run_ui(input.clone(), |ui| app.frame_ui(ui));
+            output.textures_delta.clear();
+            fn walk(shape: &egui::epaint::Shape, placed: &mut Vec<(String, f32)>) {
+                match shape {
+                    egui::epaint::Shape::Text(text) => {
+                        placed.push((text.galley.job.text.clone(), text.pos.y))
+                    }
+                    egui::epaint::Shape::Vec(shapes) => {
+                        shapes.iter().for_each(|shape| walk(shape, placed))
+                    }
+                    _ => {}
+                }
+            }
+            for clipped in &output.shapes {
+                walk(&clipped.shape, &mut placed);
+            }
+        }
+        let at = |label: &str| -> f32 {
+            placed
+                .iter()
+                .find(|(text, _)| text == label)
+                .unwrap_or_else(|| panic!("{label} was never drawn: {placed:?}"))
+                .1
+        };
+        let (queue, recents) = (at("Queue"), at("Recent"));
+        assert!(
+            (queue - recents).abs() < 1.0,
+            "both chips sit on one line at {} wide: Queue at {queue}, Recent at {recents}",
+            crate::theme::SIDE_PANEL_MIN_WIDTH
+        );
         app.backend.shutdown();
     }
 
@@ -1057,8 +1153,7 @@ mod tests {
         app.show_queue_panel = true;
         app.show_devices = true;
         frame(&ctx, &mut app);
-        // The drawer again with a hand-queued song, so the Playing next
-        // section lays out too.
+        // Draw the Playing next section with a manual queue row.
         if let Loadable::Loaded(queue) = &app.queue
             && let Some(first) = queue.queue.first()
         {
@@ -1333,9 +1428,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// A drop between two unpinned playlists creates the custom order too:
-    /// nothing was pinned, so the snapshot is simply the shelf as shown
-    /// with the moved row in its new place.
+    /// Reordering unpinned playlists creates a custom sidebar order.
     #[test]
     fn dropping_between_unpinned_playlists_creates_the_custom_order() {
         let root =

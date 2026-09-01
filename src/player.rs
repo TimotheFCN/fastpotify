@@ -1,4 +1,4 @@
-//! Local playback: a Spotify Connect device built on librespot.
+//! Local Spotify Connect playback through librespot.
 //!
 //! The engine owns one librespot session, player, mixer, and Spirc (the
 //! Connect state machine). Player events are folded into a [`LocalState`]
@@ -50,7 +50,8 @@ pub struct EngineConfig {
     pub volume_dir: PathBuf,
     pub audio_cache_dir: Option<PathBuf>,
     pub audio_cache_limit: Option<u64>,
-    /// Where the samples on their way out are copied for the visualiser.
+    /// Output buffer length in milliseconds.
+    pub buffer_ms: u32,
     pub tap: Arc<AudioTap>,
     /// The equalizer's settings, shared with the window that sets them.
     pub eq: crate::eq::SharedEq,
@@ -232,7 +233,7 @@ pub enum PlayerCommand {
     Toggle,
     Next,
     Previous,
-    /// Drop every hand-queued track, keeping the context's own.
+    /// Remove manually queued tracks and keep context tracks.
     ClearQueue,
     /// Queue a track or episode after the ones already queued.
     AddToQueue(String),
@@ -386,9 +387,7 @@ impl Engine {
         })
     }
 
-    /// What to resume after this engine is replaced: what was playing when
-    /// its session ended, or what is playing now if the session still
-    /// stands and the engine is being restarted anyway.
+    /// Playback state to resume after replacing this engine.
     pub fn interrupted(&self) -> Option<Interrupted> {
         let ended = self
             .interrupted
@@ -424,9 +423,7 @@ impl Engine {
         }
     }
 
-    /// The account's playlist tree, the way Spotify's own clients read
-    /// it: playlist rows in the listener's order, with markers around each
-    /// folder.
+    /// Account playlist tree in Spotify order, including folder markers.
     pub async fn rootlist(&self) -> Result<crate::rootlist::Snapshot> {
         use protobuf::Message as _;
         let mut builder = crate::rootlist::SnapshotBuilder::default();
@@ -637,14 +634,11 @@ impl Engine {
     }
 }
 
-/// The audio sink for a new player, and where the volume is applied.
+/// Builds the audio sink and chooses where volume is applied.
 ///
-/// The default is this crate's own sink, which opens the output device when
-/// playback starts and reports failure instead of panicking. It also sets
-/// the volume at the output rather than in the player: the player scales
-/// samples before they queue in the sink, so a change there was heard only
-/// once the queue had drained. librespot's other backends (PulseAudio on
-/// Linux) stay available to whoever chose one in Settings, volume and all.
+/// The default sink opens the device on playback and reports errors instead
+/// of panicking. It applies volume at output so changes affect queued audio.
+/// Other librespot backends remain available through Settings.
 type SinkAndVolume = (
     Box<dyn FnOnce() -> Box<dyn Sink> + Send>,
     Box<dyn VolumeGetter + Send>,
@@ -658,6 +652,7 @@ fn sink_builder(
     normalisation: Arc<std::sync::atomic::AtomicU64>,
 ) -> SinkAndVolume {
     let device = config.audio_device.clone();
+    let buffer_ms = config.buffer_ms;
     let tap = Arc::clone(&config.tap);
     let eq = Arc::clone(&config.eq);
     let report: ErrorHook = Arc::new(move |message: String| {
@@ -675,16 +670,14 @@ fn sink_builder(
     {
         match audio_backend::find(Some(name.to_string())) {
             Some(builder) => {
-                // The player is given no volume to apply: the tap sees
-                // the music first, and the wrapper applies the volume after
-                // it, so the bars never follow the knob and zero still
-                // shows the song.
+                // Apply volume after the tap so visualizers are independent of
+                // volume, including at zero.
                 let applied = mixer.get_soft_volume();
                 let normalisation = Arc::clone(&normalisation);
                 return (
                     Box::new(move || {
                         let sink = builder(device, AudioFormat::S16);
-                        Box::new(Tapped::new(sink, tap, Some(applied), eq, normalisation))
+                        Box::new(Tapped::new(sink, tap, applied, true, eq, normalisation))
                             as Box<dyn Sink>
                     }),
                     Box::new(NoOpVolume),
@@ -694,10 +687,13 @@ fn sink_builder(
         }
     }
     let volume = mixer.get_soft_volume();
+    // The output applies volume to queued audio. The wrapper reads the same
+    // value to calculate the pre-volume limiter ceiling.
+    let ceiling = mixer.get_soft_volume();
     (
         Box::new(move || {
-            let sink = Box::new(RodioSink::new(device, report, volume));
-            Box::new(Tapped::new(sink, tap, None, eq, normalisation)) as Box<dyn Sink>
+            let sink = Box::new(RodioSink::new(device, report, volume, buffer_ms));
+            Box::new(Tapped::new(sink, tap, ceiling, false, eq, normalisation)) as Box<dyn Sink>
         }),
         Box::new(NoOpVolume),
     )
@@ -925,6 +921,7 @@ mod tests {
     #[test]
     fn device_id_is_stable_hex() {
         let config = EngineConfig {
+            buffer_ms: crate::sink::DEFAULT_BUFFER_MS,
             tap: AudioTap::new(),
             eq: crate::eq::shared(),
             device_name: "Fastpotify".into(),

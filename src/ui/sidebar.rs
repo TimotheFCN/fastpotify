@@ -95,8 +95,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
-/// The playing album's art, docked large at the sidebar's bottom the way
-/// Spotify expands it; the chevron on hover puts it away again. (#92)
+/// Expanded album art at the bottom of the sidebar (#92).
 fn art_panel(app: &mut App, ui: &mut egui::Ui) {
     if !app.settings.art_expanded {
         return;
@@ -163,9 +162,7 @@ fn art_panel(app: &mut App, ui: &mut egui::Ui) {
         });
 }
 
-/// The playlist rows in the listener's own arrangement: folders as
-/// collapsible rows, their playlists indented under them. Only playlists
-/// the library has loaded show; the rest arrive with it. (#95)
+/// Playlist rows in account order, including collapsible folders (#95).
 fn folder_rows(app: &App, user_id: &str, entries: &mut Vec<Entry>) {
     let Some(playlists) = app.library.playlists.get() else {
         return;
@@ -323,7 +320,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                 16.0,
                 palette.secondary,
                 palette.text,
-                "Hide sidebar (Cmd+B)",
+                super::keys::platform_shortcut("Hide sidebar (Ctrl+B)", "Hide sidebar (Cmd+B)"),
             )
             .clicked()
             {
@@ -590,11 +587,8 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
         }
     }
 
-    // Pinned entries sit on top, in the order they were pinned; Liked
-    // Songs stays above them, and everyone else keeps their order. Once
-    // the playlists shelf has an order of its own, that order wins there:
-    // rows sit where they were dropped, and playlists the saved order has
-    // not met yet, the newly created and followed, wait at the top.
+    // Keep Liked Songs first, then pinned entries. A custom playlist order
+    // applies to the remaining rows; newly added playlists precede that order.
     let pin_rank = |uri: &str| {
         app.settings
             .pinned_contexts
@@ -720,16 +714,14 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
             } else {
                 DEFAULT_ROW_HEIGHT
             };
-            // While something is in hand, find where it hangs up front:
-            // neighbours shift before that row draws, so the spot cannot
-            // be discovered row by row. The fixed row height makes it
-            // arithmetic.
+            // Calculate drop positions from fixed row height because rows shift
+            // before drawing.
             let list_top = ui.cursor().top();
             let pointer = ui
                 .ctx()
                 .pointer_latest_pos()
                 .filter(|pos| ui.clip_rect().contains(*pos));
-            // A song in hand lands on a row, when that row can take one.
+            // Tracks may drop on Liked Songs or owned playlists.
             let dragging_song = egui::DragAndDrop::has_payload_of_type::<DragTrack>(ui.ctx());
             let drop_target = dragging_song
                 .then_some(pointer)
@@ -804,10 +796,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                         },
                     );
                 }
-                // Neighbours ease apart around the row that would take a
-                // song, macOS style, and part at the slot a dragged row
-                // would land in. Each row keeps one animated offset, which
-                // also eases everything back after the drag ends.
+                // Animate rows around the current track or entry drop target.
                 let shift = ui.ctx().animate_value_with_time(
                     ui.id().with(("drop-shift", index)),
                     if let Some(slot) = reorder_slot {
@@ -1231,8 +1220,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                                     "Sort by recently played",
                                 )
                             {
-                                // Dragging a row brings the listener's own
-                                // order back, so this asks no confirmation.
+                                // Clear the custom order without confirmation.
                                 app.settings.sidebar_order.clear();
                                 app.mark_settings_dirty();
                             }
@@ -1429,14 +1417,12 @@ fn drop_playlist_row(
         }
         return;
     }
-    // Below the block: the rest of the shelf takes the listener's own
-    // order, and a pinned row dropped here stops being pinned.
+    // Below the pinned block, use custom playlist order and unpin moved rows.
     if was_pinned {
         app.settings.pinned_contexts.retain(|held| held != uri);
         app.mark_settings_dirty();
         if app.settings.sidebar_order.is_empty() {
-            // The automatic order stays automatic: the row returns to
-            // living by recency.
+            // Keep automatic recency order when no custom order exists.
             return;
         }
     }
@@ -1506,10 +1492,8 @@ fn full_playlist_order(app: &App) -> Vec<String> {
         .collect()
 }
 
-/// A dropped album, artist, or podcast row lands in the pinned block:
-/// within the block the drop position is its new pin order, and below the
-/// block the row goes back to living by recency, so it simply stops being
-/// pinned. Liked Songs is not part of the pinned list and never moves.
+/// Reorders pinned albums, artists, and podcasts. Dropping below the pinned
+/// block unpins the row. Liked Songs never moves.
 fn drop_row(
     app: &mut App,
     entries: &[Entry],

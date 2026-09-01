@@ -96,8 +96,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         widgets::setting_row(
             ui,
             &palette,
-            "Make it even faster",
-            "Add your own Spotify Development Mode app as optional acceleration. Fastpotify keeps the shared app for catalog coverage and external playlists.",
+            "Personal Spotify app",
+            "Use a personal Development Mode app for a separate API quota. The shared app stays active.",
             |ui| {
                 let response = Frame::new()
                     .fill(palette.surface)
@@ -123,10 +123,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         widgets::setting_row(
             ui,
             &palette,
-            "Don't have one?",
-            "It's free and takes five minutes in Spotify's developer dashboard.",
+            "Create an app",
+            "Create one for free in Spotify's developer dashboard.",
             |ui| {
-                if theme::pill_button(ui, &palette, "Show me how", false).clicked() {
+                if theme::pill_button(ui, &palette, "Setup guide", false).clicked() {
                     app.actions.push(Action::OpenUrl(
                         "https://fastpotify.rocks/make-it-even-faster/".into(),
                     ));
@@ -147,8 +147,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             widgets::setting_row(
                 ui,
                 &palette,
-                "Personal acceleration is ready",
-                "Supported requests use your app. Shared catalog coverage stays available.",
+                "Personal app ready",
+                "Supported requests use your app. Other requests use the shared app.",
                 |ui| {
                     if theme::pill_button(ui, &palette, "Remove", false).clicked() {
                         app.settings.web_client_id = None;
@@ -161,7 +161,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 ui,
                 &palette,
                 "Authorize your personal app",
-                "Spotify opens once to verify that both sessions belong to this account.",
+                "Spotify opens in your browser to verify the account.",
                 |ui| {
                     if theme::pill_button(ui, &palette, "Authorize", true).clicked() {
                         app.actions.push(Action::ConfigurePersonalWebApp);
@@ -203,8 +203,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             }
             crate::backend::LocalPlayback::Unavailable => (
                 "Not set up",
-                "Play music on this computer. Needs Spotify Premium and a one-time browser sign-in."
-                    .to_string(),
+                "Requires Spotify Premium and a one-time browser sign-in.".to_string(),
                 Some("Enable playback here"),
             ),
         };
@@ -304,7 +303,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "Gapless playback",
-            "Run tracks into each other without silence.",
+            "Play tracks without silence between them.",
             |ui| {
                 if widgets::switch(ui, &palette, &mut app.settings.gapless).changed() {
                     changed = true;
@@ -316,7 +315,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "Keep music playing when the window closes",
-            "Fastpotify hides to the system tray. Quit from the tray menu or with Ctrl+Q.",
+            super::keys::platform_shortcut(
+                "Fastpotify hides to the system tray. Quit from the tray menu or with Ctrl+Q.",
+                "Fastpotify hides to the system tray. Quit from the tray menu or with Cmd+Q.",
+            ),
             |ui| {
                 if widgets::switch(ui, &palette, &mut app.settings.keep_playing_in_background)
                     .changed()
@@ -328,8 +330,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         widgets::setting_row(
             ui,
             &palette,
-            "Tell me when a new version is out",
-            "Asks GitHub once a day. Nothing about you is sent.",
+            "Check for updates",
+            "Checks GitHub once a day. No personal data is sent.",
             |ui| {
                 if widgets::switch(ui, &palette, &mut app.settings.check_for_updates).changed() {
                     changed = true;
@@ -371,8 +373,30 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         widgets::setting_row(
             ui,
             &palette,
+            "Output buffer",
+            "More buffering can prevent clicks on busy computers. Less buffering makes controls respond sooner.",
+            |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let current = app.settings.audio_buffer_ms;
+                    for ms in [50u32, 100, 200] {
+                        let label = format!("{ms} ms");
+                        if theme::soft_button(ui, &palette, None, &label, current == ms).clicked()
+                            && current != ms
+                        {
+                            app.settings.audio_buffer_ms = ms;
+                            changed = true;
+                            playback_dirty = true;
+                        }
+                    }
+                });
+            },
+        );
+        widgets::setting_row(
+            ui,
+            &palette,
             "Audio cache",
-            "Keep downloaded audio so replays don't stream again.",
+            "Save downloaded audio for later playback.",
             |ui| {
                 // The control area lays out right-to-left: add the rightmost item first.
                 ui.horizontal(|ui| {
@@ -413,10 +437,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 theme::subtle(
                     ui,
                     &palette,
-                    "Playback settings take effect after a restart of the local player.",
+                    "Restart local playback to apply these settings.",
                 );
             } else {
-                theme::subtle(ui, &palette, "Playback settings are applied.");
+                theme::subtle(ui, &palette, "Playback settings applied.");
             }
         });
     });
@@ -446,7 +470,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "Colour from album art",
-            "Tint pages and the player with the playing cover.",
+            "Use the current cover's colour on pages and the player bar.",
             |ui| {
                 if widgets::switch(ui, &palette, &mut app.settings.accent_from_art).changed() {
                     changed = true;
@@ -457,7 +481,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "Compact library sidebar",
-            "Show names only in the sidebar without cover artwork.",
+            "Show names without covers in the sidebar.",
             |ui| {
                 if widgets::switch(ui, &palette, &mut app.settings.sidebar_compact).changed() {
                     changed = true;
@@ -468,7 +492,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "Compact track list",
-            "Show track names and artists in a single line without cover artwork.",
+            "Show each track on one line without a cover.",
             |ui| {
                 if widgets::switch(ui, &palette, &mut app.settings.tracklist_compact).changed() {
                     changed = true;
@@ -479,7 +503,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "Interface zoom",
-            "Ctrl+Plus and Ctrl+Minus work anywhere; Ctrl+0 resets.",
+            super::keys::platform_shortcut(
+                "Ctrl+Plus and Ctrl+Minus work anywhere; Ctrl+0 resets.",
+                "Cmd+Plus and Cmd+Minus work anywhere; Cmd+0 resets.",
+            ),
             |ui| {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
@@ -511,7 +538,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "Mini player",
-            "Fastpotify becomes a small player that wears classic Winamp skins (.wsz files); the logo in the skin, or Ctrl+M, brings this window back. Drop a skin on either window to add it.",
+            super::keys::platform_shortcut(
+                "Use classic Winamp .wsz skins. Press Ctrl+M or click the skin logo to return. Drop a skin on either window to add it.",
+                "Use classic Winamp .wsz skins. Press Cmd+Shift+M or click the skin logo to return. Drop a skin on either window to add it.",
+            ),
             |ui| {
                 if theme::pill_button(ui, &palette, "Switch to it", true).clicked() {
                     app.actions.push(Action::ToggleWinampWindow);
@@ -525,7 +555,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             &palette,
             "Skin",
             &format!(
-                "Skins in {} are listed here. Thousands more are at the Winamp Skin Museum.",
+                "Installed skins are in {}. Find more at the Winamp Skin Museum.",
                 folder.display()
             ),
             |ui| {
@@ -578,7 +608,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "Size",
-            "Screen pixels per skin pixel, always a whole number so the pixels stay crisp.",
+            "Whole-number scaling keeps skin pixels sharp.",
             |ui| {
                 let scale =
                     crate::winamp::WinampState::scale(&app.settings, ui.ctx().pixels_per_point());
@@ -615,7 +645,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "MilkDrop window",
-            "The classic Winamp visualiser, drawn by projectM in a window of its own. Open it here, with the vis button in the top bar, with Ctrl+Shift+K, or with the V on the mini player. Its keys are MilkDrop's own; press ? or F1 inside it to see them. It draws the music played on this computer.",
+            super::keys::platform_shortcut(
+                "A projectM visualiser for local playback. Open it here, from the top bar, with Ctrl+Shift+K, or from the mini player's V menu. Press ? or F1 for its shortcuts.",
+                "A projectM visualiser for local playback. Open it here, from the top bar, with Cmd+Shift+K, or from the mini player's V menu. Press ? or F1 for its shortcuts.",
+            ),
             |ui| {
                 let mut open = app.settings.milkdrop_open;
                 if widgets::switch(ui, &palette, &mut open).changed() {
@@ -632,7 +665,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             &palette,
             "Presets",
             &format!(
-                "{} in {}. Presets are .milk files; put your own there. An empty folder fills itself the first time MilkDrop opens.",
+                "{} in {}. Add .milk files here. Fastpotify downloads presets when MilkDrop first opens with an empty folder.",
                 match count {
                     0 => "None yet".to_string(),
                     1 => "One preset".to_string(),
@@ -687,9 +720,10 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             &palette,
             "Frame rate",
             &match screen_hz {
-                0 => "How often the window draws. Fewer frames leave more of the machine for everything else; uncapped draws as fast as it can.".to_string(),
+                0 => "Lower rates use fewer resources. Uncapped draws as fast as possible."
+                    .to_string(),
                 hz => format!(
-                    "How often the window draws. Your screen refreshes {hz} times a second, and drawing more often than that shows nobody anything; uncapped draws as fast as it can."
+                    "Your screen refreshes at {hz} Hz. Higher rates do not add visible frames. Uncapped draws as fast as possible."
                 ),
             },
             |ui| {
@@ -746,7 +780,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "Resolution",
-            "The picture's inner resolution. Half or a quarter eases a slower machine; the window stretches it back up with hard pixels.",
+            "Half and Quarter use fewer resources and scale the image back up.",
             |ui| {
                 let current = app.settings.milkdrop_scale.max(1);
                 ui.horizontal(|ui| {
@@ -768,7 +802,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "Equalizer",
-            "Ten bands over the music played on this computer. Speakers and phones across the room play what Spotify sends them.",
+            "A ten-band equalizer for playback on this computer. It does not affect other devices.",
             |ui| {
                 let mut on = app.settings.eq_on;
                 if widgets::switch(ui, &palette, &mut on).changed() {
@@ -812,7 +846,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "Artwork cache",
-            &format!("Covers are kept in {}", app.dirs.art_cache_dir().display()),
+            &format!("Stored in {}", app.dirs.art_cache_dir().display()),
             |ui| {
                 if theme::soft_button(ui, &palette, Some(Icon::Trash), "Clear artwork", false)
                     .clicked()
@@ -825,8 +859,24 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ui,
             &palette,
             "Audio cache",
-            &format!("Audio is kept in {}", app.dirs.audio_cache_dir().display()),
+            &format!("Stored in {}", app.dirs.audio_cache_dir().display()),
             |_| {},
+        );
+        widgets::setting_row(
+            ui,
+            &palette,
+            "Play history",
+            &format!(
+                "Tracks played here are stored in {}. This file is never uploaded.",
+                app.dirs.history_file().display()
+            ),
+            |ui| {
+                if theme::soft_button(ui, &palette, Some(Icon::Trash), "Clear history", false)
+                    .clicked()
+                {
+                    app.actions.push(Action::ClearPlayHistory);
+                }
+            },
         );
         widgets::setting_row(
             ui,

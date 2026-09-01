@@ -1,4 +1,4 @@
-//! Interface-side state: what is open, what is loaded, what was asked for.
+//! UI state, loaded data, and pending actions.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -89,6 +89,32 @@ impl Page {
             "show" => Page::Show(id),
             _ => return None,
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum QueueTab {
+    #[default]
+    Queue,
+    Recents,
+}
+
+impl QueueTab {
+    pub fn encode(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::Recents => "recents",
+        }
+    }
+
+    pub fn decode(text: &str) -> Option<Self> {
+        match text {
+            "queue" => Some(Self::Queue),
+            "recents" => Some(Self::Recents),
+            // Backward compatibility with the old tab name.
+            "recently_played" => Some(Self::Recents),
+            _ => None,
+        }
     }
 }
 
@@ -234,6 +260,28 @@ impl<T> PagedList<T> {
 
 type Page_<T> = crate::api::models::Page<T>;
 
+/// Selected track-table rows for batch actions.
+///
+/// Selection belongs to one page and clears when sorting, filtering, or paging
+/// changes the row order.
+#[derive(Clone, Debug, Default)]
+pub struct RowSelection {
+    pub rows: std::collections::BTreeSet<usize>,
+    /// Row used as the anchor for shift-click ranges.
+    pub anchor: Option<usize>,
+}
+
+/// Selection behavior for a row click.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowPick {
+    /// Select only this row.
+    Only,
+    /// Toggle this row.
+    Toggle,
+    /// Everything from the anchor to here.
+    Range,
+}
+
 /// A cursor-paginated list (followed artists).
 #[derive(Clone, Debug)]
 pub struct CursorList<T> {
@@ -355,12 +403,11 @@ pub struct PlaylistPage {
     pub playlist: Loadable<Playlist>,
     pub items: PagedList<PlaylistItem>,
     pub filter: String,
-    /// Ids of everyone who added songs, from the pages seen so far and one
-    /// look at the tail.
+    /// Contributor IDs from loaded pages and a sample of the final page.
     pub contributors: std::collections::BTreeSet<String>,
-    /// Whether the tail was sampled for who added its songs.
+    /// Whether contributors were sampled from the final page.
     pub tail_checked: bool,
-    /// The whole list came from disk and matches the live snapshot.
+    /// Whether the complete disk cache matches the live snapshot.
     pub cache_complete: bool,
     /// Items read from disk, waiting for the live snapshot to confirm.
     pub pending_cache: Option<(String, Vec<PlaylistItem>)>,
@@ -438,8 +485,7 @@ pub enum SortColumn {
     Index,
 }
 
-/// One of the things a track row can be part of, for playback context and
-/// for the actions the row offers.
+/// Playback and action context for a track row.
 #[derive(Clone, Debug, PartialEq)]
 pub enum RowContext {
     /// A Spotify context (playlist, album) that can be played from an offset.
@@ -450,33 +496,27 @@ pub enum RowContext {
     },
     /// A loose list of tracks, played as a queue of URIs.
     Uris(Vec<String>),
-    /// A row of Next up. Playing one consumes the queue down to it, the
-    /// way pressing Next that many times would, so the playing context
-    /// and the rows after it stay intact.
+    /// A Next up row. Playing it consumes that row and all rows before it.
     Queue,
-    /// A sorted or filtered view of a context: plays exactly the list on
-    /// screen, while the context stays what the interface calls playing.
+    /// A sorted or filtered context view that plays the displayed rows.
     View {
         uris: Vec<String>,
         context_uri: String,
     },
 }
 
-/// The track in hand while a row is dragged, until a sidebar row takes it.
+/// Track data held during a drag.
 #[derive(Clone, Debug)]
 pub struct DragTrack {
     pub uri: String,
     pub title: String,
-    /// Small cover art for the chip that rides the pointer.
+    /// Cover art for the drag preview.
     pub image: Option<String>,
-    /// Where the drag began when it began on an editable playlist: that
-    /// playlist's id and the row's real index, so the same table can move
-    /// the row instead of copying it. The sidebar ignores this.
+    /// Source playlist ID and row index for moves within an editable playlist.
     pub from: Option<(String, u32)>,
 }
 
-/// A sidebar row in hand while it is dragged to a new place in the
-/// pinned block.
+/// Sidebar entry held during a drag.
 #[derive(Clone, Debug)]
 pub struct DragEntry {
     pub uri: String,
@@ -558,8 +598,7 @@ pub struct Toast {
     pub created: Instant,
 }
 
-/// What views ask the app to do. Collected while drawing, applied after, so
-/// a view can iterate over app data without fighting the borrow checker.
+/// Actions emitted while drawing and applied afterward to avoid borrow conflicts.
 #[derive(Clone, Debug)]
 pub enum Action {
     Open(Page),
@@ -589,7 +628,7 @@ pub enum Action {
     Seek(u32),
     SeekBy(i64),
     SetVolume(u8),
-    /// The slider mid-drag: heard at once, told to Spotify on release.
+    /// Preview volume locally during a drag; send it to Spotify on release.
     PreviewVolume(u8),
     VolumeBy(i8),
     ToggleMute,
@@ -602,6 +641,15 @@ pub enum Action {
         label: String,
     },
     ToggleSaved(String),
+    /// Queue several songs in order and show one notification.
+    QueueMany {
+        songs: Vec<(String, String)>,
+    },
+    /// Set saved state for several songs explicitly.
+    SetSavedMany {
+        uris: Vec<String>,
+        saved: bool,
+    },
     AddToPlaylist {
         playlist_id: String,
         playlist_name: String,
@@ -635,23 +683,25 @@ pub enum Action {
     ChangeFolders(crate::rootlist::Intent),
     RefreshFolders,
     Transfer(String),
-    /// Hand the account to a receiver found on the local network.
+    /// Send the account to a receiver found on the local network.
     ActivateReceiver(Box<crate::zeroconf::Receiver>),
     RefreshDevices,
     /// Empty Next up of its queued songs, keeping the context's own.
     ClearQueue,
-    /// The queue, made permanent: a new playlist of the playing song and
-    /// every row after it.
+    /// Save the current and upcoming queue as a playlist.
     SaveQueueAsPlaylist,
     RefreshQueue,
     CopyLink(String),
-    /// A web page, in the browser.
+    /// Open a web page in the browser.
     OpenUrl(String),
     OpenInSpotify(String),
     Search(String),
     SetSearchFilter(SearchFilter),
     FocusSearch,
     LoadMore(Page),
+    LoadMoreRecents,
+    ReloadRecents,
+    SetQueueTab(QueueTab),
     LoadMoreArtistAlbums(String),
     SetDiscographyFilter {
         artist_id: String,
@@ -674,19 +724,21 @@ pub enum Action {
     ShowWindow,
     HideWindow,
     ClearArtCache,
+    /// Clear local play history.
+    ClearPlayHistory,
     /// Open or close the Winamp window.
     ToggleWinampWindow,
-    /// Wear a skin from the skins folder, or the built-in one for `None`.
+    /// Select a skin, or the built-in skin for `None`.
     SetSkin(Option<String>),
-    /// Copy a skin file into the skins folder and wear it.
+    /// Install and select a skin file.
     InstallSkin(std::path::PathBuf),
     /// Screen pixels per skin pixel in the Winamp window.
     SetSkinScale(u8),
     ToggleWinampOnTop,
     OpenSkinsFolder,
-    /// Bars, then the scope, then nothing, in the mini player's display.
+    /// Cycle bars, scope, and off.
     CycleVisualiser,
-    /// One of those, by name.
+    /// Set the visualizer mode directly.
     SetVisualiser(crate::settings::VisMode),
     /// Open or close the playlist window under the mini player.
     ToggleWinampPlaylist,

@@ -23,7 +23,7 @@ pub fn side_panel(app: &mut App, ui: &mut egui::Ui) {
     let panel = egui::Panel::right("lyrics-panel")
         .resizable(true)
         .default_size(app.settings.lyrics_width)
-        .size_range(280.0..=640.0)
+        .size_range(theme::SIDE_PANEL_MIN_WIDTH..=640.0)
         .show_separator_line(false)
         .frame(
             Frame::new()
@@ -68,7 +68,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
             &palette,
             Icon::Mic,
             "Nothing playing",
-            "Play something and its words show up here.",
+            "Play a song to see its lyrics.",
         );
         return;
     };
@@ -93,7 +93,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                 &palette,
                 Icon::Mic,
                 "No lyrics",
-                "No lyrics found for this one.",
+                "No lyrics found for this track.",
             );
             return;
         }
@@ -103,7 +103,7 @@ fn contents(app: &mut App, ui: &mut egui::Ui) {
                 &palette,
                 Icon::Music,
                 "Instrumental",
-                "No words to follow on this one.",
+                "No timed lyrics for this track.",
             );
             return;
         }
