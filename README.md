@@ -35,8 +35,8 @@ application rather than a shell plugin.
   after which they behave like any other Spotify Connect device.
 - **Library access.** Playlists, Liked Songs, saved albums, followed
   artists, podcasts, and saved episodes, filterable in the sidebar and as
-  full pages. Spotify playlist folders can be created, renamed, nested,
-  reordered, and deleted. Sidebar rows can also be pinned to the top.
+  full pages. Sidebar rows pin to the top, and the Playlists shelf follows
+  Spotify's own folders: create, rename, nest, reorder, and delete them.
 - **Search** across songs, artists, albums, playlists, podcasts, and episodes,
   with a top result and per-type views.
 - **Home** with Made for you, Recently played, your top artists and songs, and

@@ -46,26 +46,28 @@ context menu, drag a row into the block to pin it where you drop it,
 drag within the block to reorder it, and drag a pinned row below the
 block to unpin it.
 
-Below the pins, the Playlists shelf follows Spotify's folder hierarchy and
-order. The **+** button can create a playlist or folder. Folder and playlist
-menus can move an item to another folder, and dragging moves it before a
-sibling, into a folder, or back to the root. Deleting a folder keeps its
-playlists in Your Library. These changes appear in Spotify's
-other clients. A pinned playlist remains a shortcut at the top; dragging that
-shortcut changes the pin and does not move the playlist itself.
+Below the pins, the Playlists shelf follows Spotify's own folder
+hierarchy and order. The **+** button makes a playlist or a folder, a
+folder's or playlist's menu moves it to another folder, and dragging a
+row drops it before a sibling, into a folder, or back at the root.
+Deleting a folder keeps its playlists in Your Library. Every one of these
+changes reaches Spotify's other clients. A pinned playlist stays a
+shortcut at the top: dragging the shortcut moves the pin, not the
+playlist. Folders start collapsed, and the ones you open are open again
+next time.
 
-Folders start collapsed. Fastpotify remembers which folders you open and
-restores them after an app restart. New folders also start collapsed.
+Folders need playback and the Web API signed in to the same account, so
+use **Enable** beside the sidebar's folder note to start playback again
+after a full sign-out. Until playback is up, the last hierarchy stays on
+screen but cannot be changed, and filtering the shelf lists playlists
+flat, because hidden siblings would make a drop ambiguous.
 
-Folder access needs the live playback session and Web API sign-in to belong to
-the same account. A personal Web API app does not replace playback
-authorization. Full sign-out removes that authorization, so use **Enable**
-beside the folder note in the sidebar after signing in again. While playback
-is starting or disconnected, the last loaded hierarchy remains visible but
-read-only. If no hierarchy has loaded yet, the shelf returns to its flat
-playlist list and its previous local order. Filtering also shows flat results
-and disables folder reordering because hidden siblings would make a drop
-ambiguous.
+Without a hierarchy the shelf falls back to a flat list, sorting
+playlists by when you last played them. Drag one to a new place and the
+rest of the shelf switches to your own order instead: rows stay exactly
+where you drop them, and new playlists wait just under the pins until you
+place them. Choose **Sort by recently played** from any playlist's
+context menu to go back.
 
 The Albums, Artists, and Podcasts shelves pin the same way: drag into the
 block, within it, or below it.

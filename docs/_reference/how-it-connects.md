@@ -91,9 +91,9 @@ changes use the same session token and a single protobuf POST through
 Fastpotify's HTTP client. The client never retries that POST. It reads the
 rootlist back until Spotify confirms the requested change.
 
-If the private response is malformed, the accounts do not match, or playback
-is disconnected, Fastpotify stops writing folders. The last complete rootlist
-is cached by account so its hierarchy can appear while the live session starts.
-This cache is display-only and only bridges that wait: when folders turn out
-to be unreachable, and on sign-out, it is discarded and the sidebar falls back
-to the flat playlist shelf. Fastpotify does not poll this endpoint.
+If the accounts do not match, playback is disconnected, or the private
+response is malformed, Fastpotify stops writing folders. It caches the last
+complete rootlist per account so the hierarchy can appear while the session
+starts; that cache only bridges the wait, and Fastpotify discards it on
+sign-out or once folders turn out to be unreachable, leaving the sidebar its
+flat playlist shelf. Fastpotify never polls this endpoint.

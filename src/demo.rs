@@ -641,63 +641,6 @@ pub fn apply_flags(app: &mut App, page: Option<&str>, show: Option<&str>) {
             "presets" => app.winamp.open_presets = true,
             "art" => app.settings.art_expanded = true,
             "folders" => install_folder_fixture(app),
-            "folders-collapsed" => {
-                install_folder_fixture(app);
-                app.expanded_folders.clear();
-            }
-            "folders-read-only" => {
-                install_folder_fixture(app);
-                app.local_ready = false;
-                app.local_playback = crate::backend::LocalPlayback::Unavailable;
-            }
-            "folders-fallback" => app.folders.reset(),
-            "folders-filtered" => {
-                install_folder_fixture(app);
-                app.library.filter = "mix".into();
-            }
-            "folders-pending" => {
-                install_folder_fixture(app);
-                let plan = app
-                    .folders
-                    .plan(crate::rootlist::Intent::RenameFolder {
-                        folder: "f1".parse().unwrap(),
-                        name: "Focus now".into(),
-                    })
-                    .unwrap()
-                    .unwrap();
-                app.folders.set_demo_pending(plan);
-            }
-            "folders-move" => {
-                install_folder_fixture(app);
-                app.dialog = Some(Dialog::MoveToFolder {
-                    node: crate::rootlist::Node::Playlist("spotify:playlist:pl4".into()),
-                    current: None,
-                    query: String::new(),
-                });
-            }
-            "folders-many-move" => {
-                install_many_folder_fixture(app);
-                app.dialog = Some(Dialog::MoveToFolder {
-                    node: crate::rootlist::Node::Playlist("spotify:playlist:pl4".into()),
-                    current: None,
-                    query: String::new(),
-                });
-            }
-            "folders-rename" => {
-                install_folder_fixture(app);
-                app.dialog = Some(Dialog::EditFolder {
-                    folder: Some("f1".parse().unwrap()),
-                    parent: None,
-                    name: "Focus".into(),
-                });
-            }
-            "folders-delete" => {
-                install_folder_fixture(app);
-                app.dialog = Some(Dialog::ConfirmDeleteFolder {
-                    folder: "f1".parse().unwrap(),
-                    name: "Focus".into(),
-                });
-            }
             "small" => app.settings.skin_scale = Some(1),
             "compact" => {
                 app.settings.sidebar_compact = true;
@@ -822,29 +765,6 @@ fn install_folder_fixture(app: &mut App) {
     app.folders
         .set_demo("demo", crate::rootlist::Snapshot::parse(&uris).unwrap());
     app.expanded_folders.insert("f1".parse().unwrap());
-}
-
-#[cfg(feature = "demo")]
-fn install_many_folder_fixture(app: &mut App) {
-    let mut uris = vec![
-        "spotify:start-group:10:Work".into(),
-        "spotify:start-group:11:Current+projects".into(),
-        "spotify:end-group:11".into(),
-        "spotify:start-group:12:Research".into(),
-        "spotify:end-group:12".into(),
-        "spotify:end-group:10".into(),
-    ];
-    for index in 0..24 {
-        let id = 0x20 + index;
-        uris.push(format!(
-            "spotify:start-group:{id:x}:Archive+{:02}",
-            index + 1
-        ));
-        uris.push(format!("spotify:end-group:{id:x}"));
-    }
-    uris.push("spotify:playlist:pl4".into());
-    app.folders
-        .set_demo("demo", crate::rootlist::Snapshot::parse(&uris).unwrap());
 }
 
 #[cfg(test)]

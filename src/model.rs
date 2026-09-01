@@ -5,7 +5,11 @@ use std::time::{Duration, Instant};
 
 use crate::api::models::*;
 
+/// How long to wait before asking again, when Spotify answers with a
+/// snapshot from before a change made here.
 pub const STALE_ANSWER_RECHECK: Duration = Duration::from_millis(700);
+/// How many stale answers are asked again before Spotify's version of
+/// events wins anyway.
 pub const STALE_ANSWER_RETRIES: u8 = 6;
 
 /// Every screen the central panel can show.

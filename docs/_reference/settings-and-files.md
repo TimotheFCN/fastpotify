@@ -103,11 +103,9 @@ the interface with sample data, useful for screenshots, theming, and
 interface work. Demo mode never writes settings.
 
 `--demo-page` opens a page, such as `home`, `playlist:pl1`, or `artist:art0`,
-and `--demo-show` adds surfaces on top of it. Folder review surfaces are
-`folders`, `folders-collapsed`, `folders-read-only`, `folders-fallback`,
-`folders-filtered`, `folders-pending`, and `folders-move`; the other values
-include `queue`, `devices`, `shortcuts`, `premium`, `create`, `light`, `focus`,
-`winamp`, `playlist`, `eq`, `eq-shade`, and `compact`.
+and `--demo-show` adds surfaces on top of it: a comma separated list of
+`queue`, `devices`, `shortcuts`, `premium`, `create`, `folders`, `light`,
+`focus`, `winamp`, `playlist`, `eq`, `eq-shade`, and `compact`.
 
 `--demo-shot <PATH>` writes the window to a PNG and exits, which is how the
 screenshots in these pages are made:

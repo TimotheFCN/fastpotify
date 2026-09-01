@@ -32,7 +32,8 @@ struct Cli {
     #[arg(long)]
     demo_page: Option<String>,
 
-    /// Extra demo surfaces, as a comma-separated list.
+    /// Extra demo surfaces: a comma-separated list of `queue`, `devices`,
+    /// `shortcuts`, `create`, `light`, `focus`.
     #[cfg(feature = "demo")]
     #[arg(long)]
     demo_show: Option<String>,

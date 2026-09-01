@@ -903,11 +903,6 @@ impl FolderState {
     pub fn set_demo(&mut self, account_id: &str, snapshot: Snapshot) {
         self.finish_refresh(account_id.to_string(), Ok(snapshot));
     }
-
-    #[cfg(any(test, feature = "demo"))]
-    pub fn set_demo_pending(&mut self, plan: Plan) {
-        let _ = self.begin_mutation(plan);
-    }
 }
 
 impl Mutation {
